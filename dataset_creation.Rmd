@@ -1,0 +1,218 @@
+---
+title: "Dataset creation"
+output: html_notebook
+---
+
+
+
+## Overview
+
+This notebook curates a dataset of drugs for use in milk to plasma (MP) ratio model training. For each drug, the following variables are extracted or calculated:
+
+- **MW, PSA, HBD, HBA, SMILES** : extracted from ChEMBL molecule API
+- **Fu** : extracted from ChEMBL activity API (human plasma only)
+- **LogP** : extracted from ChEMBL molecule API (alogp field)
+- **pKa** : extracted from ChEMBL activity API (experimental values)
+- **LogD7.4** : three columns: experimental (ChEMBL), calculated (from LogP + pKa), predicted (SMILES-based model)
+
+PubChem is used as a fallback if a drug is not found in ChEMBL.
+
+
+
+## Setup
+```{r}
+library(httr2)
+library(jsonlite)
+library(dplyr)
+```
+
+
+
+```{r}
+drug_names <- c("Amphetamine", "Acetaminophen", "Aspirin", "Enalapril",
+                "Ethinyl estradiol", "Ethosuximide", "Ivermectin", "Methohexital",
+                "Norethindrone", "Phenobarbital", "Theophylline", "Thiopental",
+                "Tinidazole", "Valproic Acid", "Zonisamide", "Alprazolam",
+                "Amitriptyline", "Amlodipine", "Amoxapine")
+
+cat("Total drugs:", length(drug_names))
+```
+
+
+## Step 1: Extract Molecule Properties from ChEMBL
+Extracts MW, PSA, HBD, HBA, LogP, and SMILES from the ChEMBL molecule API.
+Filters for exact name matches only. Duplicates are removed after joining.
+
+```{r molecule-extraction, message=TRUE}
+molecule_results <- data.frame()
+
+for (drug in drug_names) {
+  message(paste("Fetching molecule data for:", drug))
+  
+  url <- paste0("https://www.ebi.ac.uk/chembl/api/data/molecule/search.json?q=",
+                utils::URLencode(drug), "&limit=10")
+  
+  req <- httr2::request(url) |> httr2::req_headers(Accept = "application/json")
+  response <- httr2::req_perform(req)
+  parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+  
+  if (is.null(parsed$molecules) || nrow(parsed$molecules) == 0) {
+    message(paste("No results found for:", drug))
+    next
+  }
+  
+  match <- parsed$molecules |>
+    dplyr::filter(tolower(pref_name) == tolower(drug)) |>
+    dplyr::select(
+      pref_name,
+      molecule_chembl_id,
+      molecule_properties.full_mwt,
+      molecule_properties.psa,
+      molecule_properties.hbd,
+      molecule_properties.hba,
+      molecule_properties.alogp,
+      molecule_structures.canonical_smiles
+    ) |>
+    dplyr::slice(1)
+  
+  if (nrow(match) == 0) {
+    message(paste("No exact match for:", drug))
+    next
+  }
+  
+  match$Drug_Input <- drug
+  molecule_results <- dplyr::bind_rows(molecule_results, match)
+}
+
+molecule_results <- molecule_results |>
+  dplyr::distinct(pref_name, molecule_chembl_id, .keep_all = TRUE)
+
+cat("Drugs successfully matched:", nrow(molecule_results), "of", length(drug_names))
+```
+
+## Step 2: Extract Fu from ChEMBL Activity API
+Extracts unbound fraction in plasma (Fu) from ChEMBL activity data.
+
+Filtering logic:
+
+- Human assays only: target_organism is NA or Homo sapiens
+- Plasma measurements only: assay_description contains "plasma" or "human"
+- Tissue measurements excluded
+- Animal keywords excluded (using word boundaries to avoid substring matches)
+- Fu values of exactly 0 or 1 are flagged for manual literature review
+
+
+
+```{r fu-extraction, message=TRUE}
+fu_results <- data.frame()
+
+for (chembl_id in molecule_results$molecule_chembl_id) {
+  message(paste("Fetching Fu data for:", chembl_id))
+  
+  tryCatch({
+    url <- paste0("https://www.ebi.ac.uk/chembl/api/data/activity.json?molecule_chembl_id=",
+                  chembl_id, "&standard_type=Fu&limit=100")
+    
+    req <- httr2::request(url) |> httr2::req_headers(Accept = "application/json")
+    response <- httr2::req_perform(req)
+    parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+    
+    activities <- parsed$activities
+    
+    if (is.null(activities) || !is.data.frame(activities) || nrow(activities) == 0) {
+      fu_results <<- dplyr::bind_rows(fu_results,
+        data.frame(molecule_chembl_id = chembl_id,
+                   Fu_median = NA, N_fu = 0,
+                   Fu_values = NA, Fu_flag = NA))
+    } else {
+      filtered <- activities |>
+        dplyr::filter(
+          (is.na(target_organism) | target_organism == "Homo sapiens") &
+          !stringr::str_detect(tolower(assay_description),
+                               "\\brat\\b|\\bmouse\\b|\\bmice\\b|\\banimal\\b|\\brabbit\\b|\\bdog\\b|\\bmonkey\\b") &
+          !stringr::str_detect(tolower(assay_description), "tissue") &
+          stringr::str_detect(tolower(assay_description), "plasma|human") &
+          !is.na(standard_value)
+        ) |>
+        dplyr::mutate(standard_value = as.numeric(standard_value)) |>
+        dplyr::filter(standard_value >= 0, standard_value <= 1)
+      
+      if (nrow(filtered) == 0) {
+        fu_results <<- dplyr::bind_rows(fu_results,
+          data.frame(molecule_chembl_id = chembl_id,
+                     Fu_median = NA, N_fu = 0,
+                     Fu_values = NA, Fu_flag = NA))
+      } else {
+        fu_summary <- filtered |>
+          dplyr::summarise(
+            Fu_median = median(standard_value, na.rm = TRUE),
+            N_fu = dplyr::n(),
+            Fu_values = paste(standard_value, collapse = ", "),
+            Fu_flag = ifelse(any(standard_value == 0 | standard_value == 1),
+                             "FLAG: contains 0 or 1", NA)
+          ) |>
+          dplyr::mutate(molecule_chembl_id = chembl_id)
+        
+        fu_results <<- dplyr::bind_rows(fu_results, fu_summary)
+      }
+    }
+    
+  }, error = function(e) {
+    message(paste("Error processing", chembl_id, ":", e$message))
+    fu_results <<- dplyr::bind_rows(fu_results,
+      data.frame(molecule_chembl_id = chembl_id,
+                 Fu_median = NA, N_fu = 0,
+                 Fu_values = NA, Fu_flag = NA))
+  })
+}
+```
+
+
+## Step 3: Combine and Review
+```{r combine}
+final_dataset <- molecule_results |>
+  dplyr::left_join(fu_results, by = "molecule_chembl_id") |>
+  dplyr::rename(
+    Drug      = pref_name,
+    ChEMBL_ID = molecule_chembl_id,
+    MW        = molecule_properties.full_mwt,
+    PSA       = molecule_properties.psa,
+    HBD       = molecule_properties.hbd,
+    HBA       = molecule_properties.hba,
+    LogP      = molecule_properties.alogp,
+    SMILES    = molecule_structures.canonical_smiles
+  ) |>
+  dplyr::select(Drug, ChEMBL_ID, MW, PSA, HBD, HBA, LogP,
+                Fu_median, N_fu, Fu_values, Fu_flag, SMILES)
+
+final_dataset
+```
+
+## Step 4 : Quality Check
+
+```{r quality-check}
+cat("DATASET SUMMARY\n")
+cat("Total drugs:", nrow(final_dataset), "\n")
+cat("Drugs with Fu:", sum(!is.na(final_dataset$Fu_median)), "\n")
+cat("Drugs missing Fu (need literature lookup):", sum(is.na(final_dataset$Fu_median)), "\n")
+cat("Drugs with flagged Fu (need literature review):", sum(!is.na(final_dataset$Fu_flag)), "\n")
+cat("Drugs missing MW (need investigation):", sum(is.na(final_dataset$MW)), "\n")
+
+cat("\nDRUGS MISSING Fu\n")
+final_dataset |>
+  dplyr::filter(is.na(Fu_median)) |>
+  dplyr::select(Drug, ChEMBL_ID) |>
+  print()
+
+cat("\nFLAGGED Fu VALUES\n")
+final_dataset |>
+  dplyr::filter(!is.na(Fu_flag)) |>
+  dplyr::select(Drug, Fu_median, N_fu, Fu_values, Fu_flag) |>
+  print()
+
+cat("\nDRUGS MISSING PROPERTIES\n")
+final_dataset |>
+  dplyr::filter(is.na(MW)) |>
+  dplyr::select(Drug, ChEMBL_ID) |>
+  print()
+```
