@@ -24,16 +24,16 @@ PubChem is used as a fallback if a drug is not found in ChEMBL.
 library(httr2)
 library(jsonlite)
 library(dplyr)
+library(readxl)
 ```
 
 
 
-```{r}
-drug_names <- c("Amphetamine", "Acetaminophen", "Aspirin", "Enalapril",
-                "Ethinyl estradiol", "Ethosuximide", "Ivermectin", "Methohexital",
-                "Norethindrone", "Phenobarbital", "Theophylline", "Thiopental",
-                "Tinidazole", "Valproic Acid", "Zonisamide", "Alprazolam",
-                "Amitriptyline", "Amlodipine", "Amoxapine")
+```{r drug-list}
+library(readxl)
+
+drug_names <- readxl::read_excel("data/drug.xlsx") |>
+  dplyr::pull(Drug)
 
 cat("Total drugs:", length(drug_names))
 ```
@@ -49,39 +49,44 @@ molecule_results <- data.frame()
 for (drug in drug_names) {
   message(paste("Fetching molecule data for:", drug))
   
-  url <- paste0("https://www.ebi.ac.uk/chembl/api/data/molecule/search.json?q=",
-                utils::URLencode(drug), "&limit=10")
-  
-  req <- httr2::request(url) |> httr2::req_headers(Accept = "application/json")
-  response <- httr2::req_perform(req)
-  parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
-  
-  if (is.null(parsed$molecules) || nrow(parsed$molecules) == 0) {
-    message(paste("No results found for:", drug))
-    next
-  }
-  
-  match <- parsed$molecules |>
-    dplyr::filter(tolower(pref_name) == tolower(drug)) |>
-    dplyr::select(
-      pref_name,
-      molecule_chembl_id,
-      molecule_properties.full_mwt,
-      molecule_properties.psa,
-      molecule_properties.hbd,
-      molecule_properties.hba,
-      molecule_properties.alogp,
-      molecule_structures.canonical_smiles
-    ) |>
-    dplyr::slice(1)
-  
-  if (nrow(match) == 0) {
-    message(paste("No exact match for:", drug))
-    next
-  }
-  
-  match$Drug_Input <- drug
-  molecule_results <- dplyr::bind_rows(molecule_results, match)
+  tryCatch({
+    url <- paste0("https://www.ebi.ac.uk/chembl/api/data/molecule/search.json?q=",
+                  utils::URLencode(drug), "&limit=50")
+    
+    req <- httr2::request(url) |> httr2::req_headers(Accept = "application/json")
+    response <- httr2::req_perform(req)
+    parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+    
+    molecules <- parsed$molecules
+    
+    if (is.null(molecules) || !is.data.frame(molecules) || nrow(molecules) == 0) {
+      message(paste("No results found for:", drug))
+    } else {
+      match <- molecules |>
+        dplyr::filter(tolower(pref_name) == tolower(drug)) |>
+        dplyr::select(
+          pref_name,
+          molecule_chembl_id,
+          molecule_properties.full_mwt,
+          molecule_properties.psa,
+          molecule_properties.hbd,
+          molecule_properties.hba,
+          molecule_properties.alogp,
+          molecule_structures.canonical_smiles
+        ) |>
+        dplyr::slice(1)
+      
+      if (nrow(match) == 0) {
+        message(paste("No exact match for:", drug))
+      } else {
+        match$Drug_Input <- drug
+        molecule_results <<- dplyr::bind_rows(molecule_results, match)
+      }
+    }
+    
+  }, error = function(e) {
+    message(paste("Error processing", drug, ":", e$message))
+  })
 }
 
 molecule_results <- molecule_results |>
@@ -216,3 +221,97 @@ final_dataset |>
   dplyr::select(Drug, ChEMBL_ID) |>
   print()
 ```
+
+```{r unmatched-drugs}
+unmatched <- drug_names[!tolower(drug_names) %in% tolower(final_dataset$Drug)]
+cat("Unmatched drugs:", length(unmatched), "\n\n")
+print(unmatched)
+```
+
+```{r check-names}
+uncertain <- c("Estradiol", "Ethanol", "Benzylpenicillin", 
+               "Methotrexate", "Azapropazone", "Medroxyprogesterone")
+
+for (drug in uncertain) {
+  url <- paste0("https://www.ebi.ac.uk/chembl/api/data/molecule/search.json?q=",
+                utils::URLencode(drug), "&limit=5")
+  
+  req <- httr2::request(url) |> httr2::req_headers(Accept = "application/json")
+  response <- httr2::req_perform(req)
+  parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+  
+  if (!is.null(parsed$molecules) && nrow(parsed$molecules) > 0) {
+    cat("\n", drug, "— top matches in ChEMBL:\n")
+    print(parsed$molecules$pref_name[1:min(3, nrow(parsed$molecules))])
+  } else {
+    cat("\n", drug, "— no results found\n")
+  }
+}
+```
+
+```{r pubchem-fallback}
+missing_props <- final_dataset |>
+  dplyr::filter(is.na(MW)) |>
+  dplyr::pull(Drug)
+
+cat("Drugs needing PubChem fallback:", length(missing_props), "\n")
+print(missing_props)
+
+manual_cids <- list(
+  "IVERMECTIN" = 6321424
+)
+
+pubchem_results <- data.frame()
+
+for (drug in missing_props) {
+  message(paste("Fetching PubChem data for:", drug))
+  
+  if (toupper(drug) %in% names(manual_cids)) {
+    cid <- manual_cids[[toupper(drug)]]
+    url <- paste0("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/",
+                  cid,
+                  "/property/MolecularWeight,XLogP,TPSA,HBondDonorCount,HBondAcceptorCount,ConnectivitySMILES/JSON")
+  } else {
+    url <- paste0("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/",
+                  utils::URLencode(drug),
+                  "/property/MolecularWeight,XLogP,TPSA,HBondDonorCount,HBondAcceptorCount,ConnectivitySMILES/JSON")
+  }
+  
+  req <- httr2::request(url)
+  response <- httr2::req_perform(req)
+  parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+  props <- parsed$PropertyTable$Properties
+  
+  new_row <- data.frame(
+    Drug   = toupper(drug),
+    MW     = as.character(props$MolecularWeight),
+    PSA    = as.character(props$TPSA),
+    HBD    = as.integer(props$HBondDonorCount),
+    HBA    = as.integer(props$HBondAcceptorCount),
+    LogP   = as.character(props$XLogP),
+    SMILES = as.character(props$ConnectivitySMILES),
+    Source = "PubChem"
+  )
+  
+  pubchem_results <- dplyr::bind_rows(pubchem_results, new_row)
+  
+  final_dataset <<- final_dataset |>
+    dplyr::mutate(
+      MW     = ifelse(Drug == toupper(drug), new_row$MW, MW),
+      PSA    = ifelse(Drug == toupper(drug), new_row$PSA, PSA),
+      HBD    = ifelse(Drug == toupper(drug), new_row$HBD, HBD),
+      HBA    = ifelse(Drug == toupper(drug), new_row$HBA, HBA),
+      LogP   = ifelse(Drug == toupper(drug), new_row$LogP, LogP),
+      SMILES = ifelse(Drug == toupper(drug), new_row$SMILES, SMILES)
+    )
+  
+  message(paste("Updated", drug, "with PubChem data"))
+}
+
+cat("\nPubChem fallback complete\n")
+print(pubchem_results)
+```
+```{r check-ivermectin}
+final_dataset |> dplyr::filter(Drug == "IVERMECTIN")
+```
+
