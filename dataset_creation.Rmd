@@ -315,3 +315,99 @@ print(pubchem_results)
 final_dataset |> dplyr::filter(Drug == "IVERMECTIN")
 ```
 
+```{r check-fu-ppb}
+chembl_id <- "CHEMBL578"
+
+# Try alternate standard_types used for plasma protein binding / Fu
+types_to_try <- c("Fu", "fu", "PPB", "Plasma protein binding", 
+                  "Fraction unbound", "Unbound fraction", "fup")
+
+results_list <- lapply(types_to_try, function(stype) {
+  url <- paste0("https://www.ebi.ac.uk/chembl/api/data/activity.json?molecule_chembl_id=",
+                chembl_id, "&standard_type=", utils::URLencode(stype), "&limit=100")
+  
+  tryCatch({
+    req <- httr2::request(url) |> httr2::req_headers(Accept = "application/json")
+    response <- httr2::req_perform(req)
+    parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+    
+    acts <- parsed$activities
+    if (is.data.frame(acts) && nrow(acts) > 0) {
+      message(stype, ": ", nrow(acts), " result(s) found")
+      acts$queried_type <- stype
+      return(acts)
+    } else {
+      message(stype, ": no results")
+      return(NULL)
+    }
+  }, error = function(e) {
+    message(stype, ": error - ", e$message)
+    return(NULL)
+  })
+})
+
+# Combine whatever came back
+hits <- dplyr::bind_rows(results_list)
+
+if (nrow(hits) > 0) {
+  hits |>
+  dplyr::mutate(dplyr::across(where(is.list),
+    ~ sapply(.x, function(v) paste(unlist(v), collapse = "; ")))) |>
+  dplyr::select(queried_type, standard_type, standard_value,
+                standard_units, assay_description) |>
+  as.data.frame() |>   # force out of tibble to avoid na.print issue
+  print()
+} else {
+  message("No PPB/Fu data found under any standard_type for ", chembl_id)
+}
+```
+
+```{r}
+final_dataset
+```
+
+```{r check-fu-duloxetine}
+url <- "https://www.ebi.ac.uk/chembl/api/data/activity.json?molecule_chembl_id=CHEMBL1175&standard_type=Fu&limit=100"
+
+req <- httr2::request(url) |> httr2::req_headers(Accept = "application/json")
+response <- httr2::req_perform(req)
+parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+
+activities <- parsed$activities
+
+if (is.null(activities) || !is.data.frame(activities) || nrow(activities) == 0) {
+  cat("No Fu data found for Duloxetine\n")
+} else {
+  activities |>
+    dplyr::select(standard_value, target_organism, assay_description) |>
+    print()
+}
+```
+
+```{r check-fu-missing}
+# Check Olanzapine and Escitalopram
+test_ids <- list(
+  "Olanzapine" = "CHEMBL715",
+  "Escitalopram" = "CHEMBL1508"
+)
+
+for (name in names(test_ids)) {
+  url <- paste0("https://www.ebi.ac.uk/chembl/api/data/activity.json?molecule_chembl_id=",
+                test_ids[[name]], "&standard_type=Fu&limit=100")
+  
+  req <- httr2::request(url) |> httr2::req_headers(Accept = "application/json")
+  response <- httr2::req_perform(req)
+  parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+  activities <- parsed$activities
+  
+  if (is.null(activities) || !is.data.frame(activities) || nrow(activities) == 0) {
+    cat(name, "— No Fu data in ChEMBL at all\n")
+  } else {
+    cat(name, "— Fu data found:\n")
+    activities |>
+      dplyr::select(standard_value, target_organism, assay_description) |>
+      print()
+  }
+}
+```
+
