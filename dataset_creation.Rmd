@@ -411,3 +411,101 @@ for (name in names(test_ids)) {
 }
 ```
 
+```{r fu-ppb-fallback, message=TRUE}
+
+final_dataset <- final_dataset |>
+  dplyr::select(-dplyr::any_of(c("PPB_value", "Fu_from_PPB", "N_ppb", "Fu_source", "Fu_final")))
+
+
+# Getting drugs still missing Fu
+missing_fu <- final_dataset |>
+  dplyr::filter(is.na(Fu_median)) |>
+  dplyr::select(Drug, ChEMBL_ID)
+
+cat("Drugs missing Fu — checking for PPB data:", nrow(missing_fu), "\n\n")
+
+ppb_results <- data.frame()
+
+for (i in 1:nrow(missing_fu)) {
+  drug <- missing_fu$Drug[i]
+  chembl_id <- missing_fu$ChEMBL_ID[i]
+  
+  tryCatch({
+    url <- paste0("https://www.ebi.ac.uk/chembl/api/data/activity.json?molecule_chembl_id=",
+                  chembl_id, "&standard_type=PPB&limit=100")
+    
+    req <- httr2::request(url) |> httr2::req_headers(Accept = "application/json")
+    response <- httr2::req_perform(req)
+    parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+    activities <- parsed$activities
+    
+    if (is.null(activities) || !is.data.frame(activities) || nrow(activities) == 0) {
+      ppb_results <- dplyr::bind_rows(ppb_results,
+        data.frame(Drug = drug, ChEMBL_ID = chembl_id,
+                   PPB_value = NA, Fu_from_PPB = NA, N_ppb = 0))
+    } else {
+      # Applying same human filter as Fu
+      filtered <- activities |>
+        dplyr::filter(
+          (is.na(target_organism) | target_organism == "Homo sapiens") &
+          !stringr::str_detect(tolower(assay_description),
+                               "\\brat\\b|\\bmouse\\b|\\bmice\\b|\\banimal\\b|\\brabbit\\b|\\bdog\\b|\\bmonkey\\b") &
+          stringr::str_detect(tolower(assay_description), "human|plasma") &
+          !is.na(standard_value)
+        ) |>
+        dplyr::mutate(standard_value = as.numeric(standard_value)) |>
+        dplyr::filter(standard_value >= 0, standard_value <= 100)
+      
+      if (nrow(filtered) == 0) {
+        ppb_results <- dplyr::bind_rows(ppb_results,
+          data.frame(Drug = drug, ChEMBL_ID = chembl_id,
+                     PPB_value = NA, Fu_from_PPB = NA, N_ppb = 0))
+      } else {
+        ppb_median <- median(filtered$standard_value, na.rm = TRUE)
+        fu_calculated <- 1 - (ppb_median / 100)
+        
+        ppb_results <- dplyr::bind_rows(ppb_results,
+          data.frame(Drug = drug, ChEMBL_ID = chembl_id,
+                     PPB_value = ppb_median,
+                     Fu_from_PPB = fu_calculated,
+                     N_ppb = nrow(filtered)))
+        
+        message(paste(drug, "— PPB found:", ppb_median, "% → Fu =", round(fu_calculated, 3)))
+      }
+    }
+    
+  }, error = function(e) {
+    message(paste("Error for", drug, ":", e$message))
+    ppb_results <<- dplyr::bind_rows(ppb_results,
+      data.frame(Drug = drug, ChEMBL_ID = chembl_id,
+                 PPB_value = NA, Fu_from_PPB = NA, N_ppb = 0))
+  })
+}
+
+# Update final_dataset with PPB derived Fu
+final_dataset <- final_dataset |>
+  dplyr::left_join(ppb_results |> dplyr::select(ChEMBL_ID, PPB_value, Fu_from_PPB, N_ppb),
+                   by = "ChEMBL_ID") |>
+  dplyr::mutate(
+    Fu_source = dplyr::case_when(
+      !is.na(Fu_median) ~ "ChEMBL_Fu",
+      !is.na(Fu_from_PPB) ~ "ChEMBL_PPB",
+      TRUE ~ NA_character_
+    ),
+    Fu_final = dplyr::coalesce(Fu_median, Fu_from_PPB)
+  )
+
+cat("\nPPB FALLBACK SUMMARY\n")
+cat("Drugs with Fu from PPB:", sum(!is.na(final_dataset$Fu_from_PPB) & is.na(final_dataset$Fu_median)), "\n")
+cat("Drugs still missing Fu:", sum(is.na(final_dataset$Fu_final)), "\n")
+
+cat("\nSTILL MISSING Fu (need literature review)\n")
+final_dataset |>
+  dplyr::filter(is.na(Fu_final)) |>
+  dplyr::select(Drug, ChEMBL_ID) |>
+  print()
+```
+
+
+
+
