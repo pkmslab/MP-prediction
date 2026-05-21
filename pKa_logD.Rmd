@@ -1,0 +1,160 @@
+---
+title: "pKa and loD"
+output: html_notebook
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(httr2)
+library(jsonlite)
+library(dplyr)
+library(stringr)
+library(readr)
+```
+
+
+```{r load-data}
+# Load dataset from notebook 01
+drug_data <- readRDS("data/final_dataset.rds")
+
+cat("Dataset loaded successfully\n")
+cat("Rows:", nrow(drug_data), "\n")
+cat("Columns:", ncol(drug_data), "\n")
+cat("Columns available:", paste(names(drug_data), collapse = ", "), "\n")
+```
+
+```{r experimental-pka, message=TRUE}
+pka_results <- data.frame()
+
+for (i in 1:nrow(drug_data)) {
+  drug <- drug_data$Drug[i]
+  chembl_id <- drug_data$ChEMBL_ID[i]
+  
+  tryCatch({
+    url <- paste0("https://www.ebi.ac.uk/chembl/api/data/activity.json?molecule_chembl_id=",
+                  chembl_id, "&standard_type=pKa&limit=100")
+    
+    req <- httr2::request(url) |> httr2::req_headers(Accept = "application/json")
+    response <- httr2::req_perform(req)
+    parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+    activities <- parsed$activities
+    
+    if (is.null(activities) || !is.data.frame(activities) || nrow(activities) == 0) {
+      pka_results <- dplyr::bind_rows(pka_results,
+        data.frame(ChEMBL_ID = chembl_id,
+                   pKa_exp = NA,
+                   N_pka = 0,
+                   pKa_values = NA))
+    } else {
+      filtered <- activities |>
+        dplyr::filter(!is.na(standard_value)) |>
+        dplyr::mutate(standard_value = as.numeric(standard_value)) |>
+        dplyr::filter(standard_value >= 0, standard_value <= 14)
+      
+      if (nrow(filtered) == 0) {
+        pka_results <- dplyr::bind_rows(pka_results,
+          data.frame(ChEMBL_ID = chembl_id,
+                     pKa_exp = NA,
+                     N_pka = 0,
+                     pKa_values = NA))
+      } else {
+        pka_results <- dplyr::bind_rows(pka_results,
+          data.frame(ChEMBL_ID = chembl_id,
+                     pKa_exp = median(filtered$standard_value, na.rm = TRUE),
+                     N_pka = nrow(filtered),
+                     pKa_values = paste(filtered$standard_value, collapse = ", ")))
+      }
+    }
+    
+  }, error = function(e) {
+    message(paste("Error for", drug, ":", e$message))
+    pka_results <<- dplyr::bind_rows(pka_results,
+      data.frame(ChEMBL_ID = chembl_id,
+                 pKa_exp = NA,
+                 N_pka = 0,
+                 pKa_values = NA))
+  })
+}
+
+# Join with drug_data
+drug_data <- drug_data |>
+  dplyr::left_join(pka_results, by = "ChEMBL_ID")
+
+cat("pKa SUMMARY\n")
+cat("Drugs with experimental pKa:", sum(!is.na(drug_data$pKa_exp)), "\n")
+cat("Drugs missing pKa:", sum(is.na(drug_data$pKa_exp)), "\n")
+```
+
+```{r experimental-logd, message=TRUE}
+logd_results <- data.frame()
+
+for (i in 1:nrow(drug_data)) {
+  drug <- drug_data$Drug[i]
+  chembl_id <- drug_data$ChEMBL_ID[i]
+  
+  tryCatch({
+    url <- paste0("https://www.ebi.ac.uk/chembl/api/data/activity.json?molecule_chembl_id=",
+                  chembl_id, "&standard_type=LogD&limit=100")
+    
+    req <- httr2::request(url) |> httr2::req_headers(Accept = "application/json")
+    response <- httr2::req_perform(req)
+    parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+    activities <- parsed$activities
+    
+    if (is.null(activities) || !is.data.frame(activities) || nrow(activities) == 0) {
+      logd_results <- dplyr::bind_rows(logd_results,
+        data.frame(ChEMBL_ID = chembl_id,
+                   LogD74_exp = NA,
+                   N_logd = 0,
+                   LogD_values = NA))
+    } else {
+      # Filter for pH 7.4 specifically
+      filtered <- activities |>
+        dplyr::filter(
+          !is.na(standard_value),
+          stringr::str_detect(tolower(assay_description), "7\\.4|7\\.40|physiolog")
+        ) |>
+        dplyr::mutate(standard_value = as.numeric(standard_value))
+      
+      if (nrow(filtered) == 0) {
+        logd_results <- dplyr::bind_rows(logd_results,
+          data.frame(ChEMBL_ID = chembl_id,
+                     LogD74_exp = NA,
+                     N_logd = 0,
+                     LogD_values = NA))
+      } else {
+        logd_results <- dplyr::bind_rows(logd_results,
+          data.frame(ChEMBL_ID = chembl_id,
+                     LogD74_exp = median(filtered$standard_value, na.rm = TRUE),
+                     N_logd = nrow(filtered),
+                     LogD_values = paste(filtered$standard_value, collapse = ", ")))
+      }
+    }
+    
+  }, error = function(e) {
+    message(paste("Error for", drug, ":", e$message))
+    logd_results <<- dplyr::bind_rows(logd_results,
+      data.frame(ChEMBL_ID = chembl_id,
+                 LogD74_exp = NA,
+                 N_logd = 0,
+                 LogD_values = NA))
+  })
+}
+
+# Join with drug_data
+drug_data <- drug_data |>
+  dplyr::left_join(logd_results, by = "ChEMBL_ID")
+
+cat("LogD7.4 SUMMARY\n")
+cat("Drugs with experimental LogD7.4:", sum(!is.na(drug_data$LogD74_exp)), "\n")
+cat("Drugs missing LogD7.4:", sum(is.na(drug_data$LogD74_exp)), "\n")
+```
+
+```{r save-dataset}
+saveRDS(drug_data, "data/drug_data_pka_logd.rds")
+readr::write_csv(drug_data, "data/drug_data_pka_logd.csv")
+
+cat("Dataset saved\n")
+cat("Rows:", nrow(drug_data), "\n")
+cat("Columns:", ncol(drug_data), "\n")
+cat("Columns:", paste(names(drug_data), collapse = ", "), "\n")
+```
