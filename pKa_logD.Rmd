@@ -23,6 +23,10 @@ cat("Columns available:", paste(names(drug_data), collapse = ", "), "\n")
 ```
 
 ```{r experimental-pka, message=TRUE}
+
+# Drop pKa columns if they already exist (allows safe rerunning)
+drug_data <- drug_data |>
+  dplyr::select(-dplyr::any_of(c("pKa_exp", "N_pka", "pKa_values")))
 pka_results <- data.frame()
 
 for (i in 1:nrow(drug_data)) {
@@ -85,6 +89,10 @@ cat("Drugs missing pKa:", sum(is.na(drug_data$pKa_exp)), "\n")
 ```
 
 ```{r experimental-logd, message=TRUE}
+
+# Drop LogD columns if they already exist (allows safe rerunning)
+drug_data <- drug_data |>
+  dplyr::select(-dplyr::any_of(c("LogD74_exp", "N_logd", "LogD_values")))
 logd_results <- data.frame()
 
 for (i in 1:nrow(drug_data)) {
@@ -157,4 +165,194 @@ cat("Dataset saved\n")
 cat("Rows:", nrow(drug_data), "\n")
 cat("Columns:", ncol(drug_data), "\n")
 cat("Columns:", paste(names(drug_data), collapse = ", "), "\n")
+```
+
+```{r export-smiles}
+# Export SMILES for OPERA input
+drug_data |>
+  dplyr::filter(!is.na(SMILES)) |>
+  dplyr::select(SMILES, Drug) |>
+  readr::write_delim("data/opera_input.smi", delim = "\t", col_names = FALSE)
+
+cat("SMILES exported:", sum(!is.na(drug_data$SMILES)), "drugs\n")
+```
+
+```{r load-opera}
+opera <- readr::read_csv("data/OPERA.csv")
+
+cat("Rows:", nrow(opera), "\n")
+cat("Columns:", ncol(opera), "\n")
+cat("\nColumn names:\n")
+print(names(opera))
+```
+
+```{r inspect-opera}
+opera |>
+  dplyr::select(INPUT, PREFERRED_NAME, OPERA_PKAA_OPERA_PRED, 
+                OPERA_PKAB_OPERA_PRED, LOGD7.4) |>
+  head(10) |>
+  print()
+
+cat("\nMissing pKa acid:", sum(is.na(opera$OPERA_PKAA_OPERA_PRED)), "\n")
+cat("Missing pKa base:", sum(is.na(opera$OPERA_PKAB_OPERA_PRED)), "\n")
+cat("Missing LogD7.4:", sum(is.na(opera$LOGD7.4)), "\n")
+```
+
+```{r merge-opera}
+# Clean up OPERA data
+opera_clean <- opera |>
+  dplyr::select(
+    INPUT,
+    pKa_acid_pred = OPERA_PKAA_OPERA_PRED,
+    pKa_base_pred = OPERA_PKAB_OPERA_PRED,
+    LogD74_pred = LOGD7.4
+  ) |>
+  dplyr::mutate(
+    pKa_acid_pred = dplyr::na_if(pKa_acid_pred, "N/A"),
+    pKa_base_pred = dplyr::na_if(pKa_base_pred, "N/A"),
+    LogD74_pred = dplyr::na_if(LogD74_pred, "N/A"),
+    pKa_acid_pred = as.numeric(pKa_acid_pred),
+    pKa_base_pred = as.numeric(pKa_base_pred),
+    LogD74_pred = as.numeric(LogD74_pred)
+  ) |>
+  dplyr::distinct(INPUT, .keep_all = TRUE)
+
+# Merge with drug_data by drug name
+drug_data <- drug_data |>
+  dplyr::left_join(opera_clean, by = c("Drug" = "INPUT"))
+
+cat("OPERA MERGE SUMMARY\n")
+cat("Rows after merge:", nrow(drug_data), "\n")
+cat("Drugs with predicted pKa acid:", sum(!is.na(drug_data$pKa_acid_pred)), "\n")
+cat("Drugs with predicted pKa base:", sum(!is.na(drug_data$pKa_base_pred)), "\n")
+cat("Drugs with predicted LogD7.4:", sum(!is.na(drug_data$LogD74_pred)), "\n")
+```
+
+```{r save-final}
+
+saveRDS(drug_data, "data/drug_data_complete.rds")
+readr::write_csv(drug_data, "data/drug_data_complete.csv")
+
+cat("Final dataset saved\n")
+cat("Rows:", nrow(drug_data), "\n")
+cat("Columns:", ncol(drug_data), "\n")
+print(names(drug_data))
+```
+
+```{r}
+head(drug_data[, c("pKa_exp.x", "pKa_exp.y", "pKa_exp")])
+```
+
+```{r clean-columns}
+# Remove duplicate pKa columns keeping only the clean ones
+drug_data <- drug_data |>
+  dplyr::select(
+    Drug, ChEMBL_ID, MW, PSA, HBD, HBA, LogP, SMILES,
+    Fu_median, N_fu, Fu_values, Fu_flag,
+    PPB_value, Fu_from_PPB, N_ppb, Fu_source, Fu_final,
+    pKa_exp, N_pka, pKa_values,
+    LogD74_exp, N_logd, LogD_values,
+    pKa_acid_pred, pKa_base_pred, LogD74_pred
+  )
+
+# Save clean version
+saveRDS(drug_data, "data/drug_data_complete.rds")
+readr::write_csv(drug_data, "data/drug_data_complete.csv")
+
+cat("Clean dataset saved\n")
+cat("Rows:", nrow(drug_data), "\n")
+cat("Columns:", ncol(drug_data), "\n")
+print(names(drug_data))
+```
+
+```{r final-quality-check}
+
+cat("    FINAL DATASET QUALITY CHECK    \n")
+
+
+cat("── OVERVIEW ──────────────────────────\n")
+cat("Total drugs:          ", nrow(drug_data), "\n")
+cat("Total columns:        ", ncol(drug_data), "\n\n")
+
+cat("── MOLECULAR PROPERTIES ──────────────\n")
+cat("MW available:         ", sum(!is.na(drug_data$MW)), "/", nrow(drug_data), "\n")
+cat("PSA available:        ", sum(!is.na(drug_data$PSA)), "/", nrow(drug_data), "\n")
+cat("HBD available:        ", sum(!is.na(drug_data$HBD)), "/", nrow(drug_data), "\n")
+cat("HBA available:        ", sum(!is.na(drug_data$HBA)), "/", nrow(drug_data), "\n")
+cat("LogP available:       ", sum(!is.na(drug_data$LogP)), "/", nrow(drug_data), "\n")
+cat("SMILES available:     ", sum(!is.na(drug_data$SMILES)), "/", nrow(drug_data), "\n\n")
+
+cat("── Fu ────────────────────────────────\n")
+cat("Fu from ChEMBL:       ", sum(drug_data$Fu_source == "ChEMBL_Fu", na.rm = TRUE), "\n")
+cat("Fu from PPB:          ", sum(drug_data$Fu_source == "ChEMBL_PPB", na.rm = TRUE), "\n")
+cat("Fu final available:   ", sum(!is.na(drug_data$Fu_final)), "/", nrow(drug_data), "\n")
+cat("Fu flagged (0 or 1):  ", sum(!is.na(drug_data$Fu_flag)), "\n")
+cat("Fu missing:           ", sum(is.na(drug_data$Fu_final)), "(need literature lookup)\n\n")
+
+cat("── pKa ───────────────────────────────\n")
+cat("Experimental pKa:     ", sum(!is.na(drug_data$pKa_exp)), "/", nrow(drug_data), "\n")
+cat("Predicted pKa acid:   ", sum(!is.na(drug_data$pKa_acid_pred)), "/", nrow(drug_data), "\n")
+cat("Predicted pKa base:   ", sum(!is.na(drug_data$pKa_base_pred)), "/", nrow(drug_data), "\n")
+cat("Both pKa missing:     ", sum(is.na(drug_data$pKa_acid_pred) & 
+                                  is.na(drug_data$pKa_base_pred)), "(likely neutral)\n\n")
+
+cat("── LogD7.4 ───────────────────────────\n")
+cat("Experimental LogD7.4: ", sum(!is.na(drug_data$LogD74_exp)), "/", nrow(drug_data), "\n")
+cat("Predicted LogD7.4:    ", sum(!is.na(drug_data$LogD74_pred)), "/", nrow(drug_data), "\n\n")
+
+cat("── DRUGS MISSING Fu (literature needed) ──\n")
+drug_data |>
+  dplyr::filter(is.na(Fu_final)) |>
+  dplyr::select(Drug, ChEMBL_ID) |>
+  print()
+
+cat("\n── DRUGS WITH FLAGGED Fu ──────────────\n")
+drug_data |>
+  dplyr::filter(!is.na(Fu_flag)) |>
+  dplyr::select(Drug, Fu_final, Fu_values, Fu_flag) |>
+  print()
+
+cat("\n── DRUGS MISSING LogD7.4 PREDICTION ──\n")
+drug_data |>
+  dplyr::filter(is.na(LogD74_pred)) |>
+  dplyr::select(Drug, ChEMBL_ID) |>
+  print()
+```
+
+```{r drug-type-classification}
+# Drop Type column if rerunning
+drug_data <- drug_data |>
+  dplyr::select(-dplyr::any_of("Type"))
+
+drug_data <- drug_data |>
+  dplyr::mutate(
+    Type = dplyr::case_when(
+      !is.na(pKa_acid_pred) & !is.na(pKa_base_pred) ~ "AMPHOLYTE",
+      !is.na(pKa_acid_pred) & is.na(pKa_base_pred)  ~ "ACID",
+      is.na(pKa_acid_pred) & !is.na(pKa_base_pred)  ~ "BASE",
+      is.na(pKa_acid_pred) & is.na(pKa_base_pred)   ~ "NEUTRAL",
+      TRUE ~ NA_character_
+    )
+  )
+
+cat("DRUG TYPE SUMMARY\n")
+drug_data |>
+  dplyr::count(Type) |>
+  print()
+
+cat("\n AMPHOLYTES \n")
+drug_data |>
+  dplyr::filter(Type == "AMPHOLYTE") |>
+  dplyr::select(Drug, pKa_acid_pred, pKa_base_pred) |>
+  print()
+```
+
+```{r save-with-type}
+saveRDS(drug_data, "data/drug_data_complete.rds")
+readr::write_csv(drug_data, "data/drug_data_complete.csv")
+
+cat("Dataset saved with Type column\n")
+cat("Rows:", nrow(drug_data), "\n")
+cat("Columns:", ncol(drug_data), "\n")
+print(names(drug_data))
 ```
