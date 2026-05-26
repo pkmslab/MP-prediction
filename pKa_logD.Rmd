@@ -239,9 +239,6 @@ cat("Columns:", ncol(drug_data), "\n")
 print(names(drug_data))
 ```
 
-```{r}
-head(drug_data[, c("pKa_exp.x", "pKa_exp.y", "pKa_exp")])
-```
 
 ```{r clean-columns}
 # Remove duplicate pKa columns keeping only the clean ones
@@ -355,4 +352,9 @@ cat("Dataset saved with Type column\n")
 cat("Rows:", nrow(drug_data), "\n")
 cat("Columns:", ncol(drug_data), "\n")
 print(names(drug_data))
+```
+
+```{r}
+methotrexate<- drug_data |> dplyr::filter(ChEMBL_ID == "CHEMBL34259")
+print(methotrexate)
 ```

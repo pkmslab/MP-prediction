@@ -505,7 +505,14 @@ final_dataset |>
   dplyr::select(Drug, ChEMBL_ID) |>
   print()
 ```
-
+```{r save-dataset}
+# Save final dataset
+saveRDS(final_dataset, "data/final_dataset.rds")
+readr::write_csv(final_dataset, "data/final_dataset.csv")
+cat("Dataset saved successfully\n")
+cat("Rows:", nrow(final_dataset), "\n")
+cat("Columns:", ncol(final_dataset), "\n")
+```
 
 
 
