@@ -1,0 +1,243 @@
+---
+title: "Environmental Contaminants Dataset"
+output: html_notebook
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(httr2)
+library(jsonlite)
+library(dplyr)
+library(stringr)
+library(readr)
+```
+
+```{r load-ec-file}
+# Load with proper headers
+ec_data <- readxl::read_excel("data/ec_cas.xlsx", skip = 1) |>
+  # Remove last empty column
+  dplyr::select(1:5) |>
+  # Rename columns
+  dplyr::rename(
+    Compound = 1,
+    CAS = 2,
+    MP = 3,
+    InChIKey = 4,
+    SMILES = 5
+  ) |>
+  # Remove MP column since we don't need it
+  dplyr::select(-MP)
+
+cat("Rows:", nrow(ec_data), "\n")
+cat("Columns:", ncol(ec_data), "\n")
+print(ec_data)
+```
+
+
+```{r chembl-extraction, message=TRUE}
+chembl_results <- data.frame()
+
+for (i in 1:nrow(ec_data)) {
+  compound <- ec_data$Compound[i]
+  inchikey <- ec_data$InChIKey[i]
+  
+  tryCatch({
+    url <- paste0("https://www.ebi.ac.uk/chembl/api/data/molecule/", inchikey)
+    
+    req <- httr2::request(url) |> httr2::req_headers(Accept = "application/json")
+    response <- httr2::req_perform(req)
+    parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+    
+    chembl_results <- dplyr::bind_rows(chembl_results,
+      data.frame(
+        Compound = compound,
+        ChEMBL_ID = parsed$molecule_chembl_id,
+        MW = parsed$molecule_properties$full_mwt,
+        PSA = parsed$molecule_properties$psa,
+        HBD = as.integer(parsed$molecule_properties$hbd),
+        HBA = as.integer(parsed$molecule_properties$hba),
+        LogP = parsed$molecule_properties$alogp
+      ))
+    message(paste("Found:", compound, "→", parsed$molecule_chembl_id))
+    
+  }, error = function(e) {
+    message(paste("No match for:", compound, "-", e$message))
+    chembl_results <<- dplyr::bind_rows(chembl_results,
+      data.frame(Compound = compound,
+                 ChEMBL_ID = NA, MW = NA, PSA = NA,
+                 HBD = NA, HBA = NA, LogP = NA))
+  })
+}
+
+cat("=== ChEMBL EXTRACTION SUMMARY ===\n")
+cat("Matched:", sum(!is.na(chembl_results$ChEMBL_ID)), "/", nrow(chembl_results), "\n")
+print(chembl_results)
+```
+```{r pubchem-fallback-ec}
+missing_ec <- ec_data |>
+  dplyr::filter(Compound %in% c("PCB-138", "PCDD 67", "PCDD 73", 
+                                 "PCDF 124", "PCDF 131", "PCDF 134", "PCDF 135"))
+
+pubchem_ec <- data.frame()
+
+for (i in 1:nrow(missing_ec)) {
+  compound <- missing_ec$Compound[i]
+  smiles <- missing_ec$SMILES[i]
+  
+  tryCatch({
+    url <- paste0("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/",
+                  utils::URLencode(smiles),
+                  "/property/MolecularWeight,XLogP,TPSA,HBondDonorCount,HBondAcceptorCount/JSON")
+    
+    req <- httr2::request(url)
+    response <- httr2::req_perform(req)
+    parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+    props <- parsed$PropertyTable$Properties
+    
+    pubchem_ec <- dplyr::bind_rows(pubchem_ec,
+      data.frame(
+        Compound = compound,
+        ChEMBL_ID = NA,
+        MW = as.character(props$MolecularWeight),
+        PSA = as.character(props$TPSA),
+        HBD = as.integer(props$HBondDonorCount),
+        HBA = as.integer(props$HBondAcceptorCount),
+        LogP = as.character(props$XLogP),
+        Source = "PubChem"
+      ))
+    message(paste("PubChem found:", compound))
+    
+  }, error = function(e) {
+    message(paste("PubChem failed for:", compound, "-", e$message))
+    pubchem_ec <<- dplyr::bind_rows(pubchem_ec,
+      data.frame(Compound = compound, ChEMBL_ID = NA,
+                 MW = NA, PSA = NA, HBD = NA, HBA = NA,
+                 LogP = NA, Source = "Not found"))
+  })
+}
+
+print(pubchem_ec)
+```
+```{r combine-ec}
+# Add source column to ChEMBL results
+chembl_results <- chembl_results |>
+  dplyr::mutate(Source = ifelse(!is.na(ChEMBL_ID), "ChEMBL", "Not found"))
+
+# Combine ChEMBL and PubChem results
+ec_combined <- chembl_results |>
+  dplyr::rows_update(
+    pubchem_ec |> dplyr::select(-ChEMBL_ID),
+    by = "Compound"
+  )
+
+# Join with original ec_data to get CAS and SMILES
+ec_final <- ec_data |>
+  dplyr::left_join(ec_combined, by = "Compound")
+
+cat("=== COMBINED SUMMARY ===\n")
+cat("Total compounds:", nrow(ec_final), "\n")
+cat("With MW:", sum(!is.na(ec_final$MW)), "\n")
+cat("With PSA:", sum(!is.na(ec_final$PSA)), "\n")
+cat("With LogP:", sum(!is.na(ec_final$LogP)), "\n")
+cat("Missing all properties:", sum(is.na(ec_final$MW)), "\n")
+
+print(ec_final |> dplyr::select(Compound, ChEMBL_ID, MW, PSA, HBD, HBA, LogP, Source))
+```
+
+
+```{r add-pcdd73}
+# Add PCDD 73 manually from PubChem CID 37270
+ec_final <- ec_final |>
+  dplyr::mutate(
+    MW = ifelse(Compound == "PCDD 73", "425.3", MW),
+    PSA = ifelse(Compound == "PCDD 73", "18.5", PSA),
+    HBD = ifelse(Compound == "PCDD 73", 0L, HBD),
+    HBA = ifelse(Compound == "PCDD 73", 2L, HBA),
+    LogP = ifelse(Compound == "PCDD 73", "7.5", LogP),
+    Source = ifelse(Compound == "PCDD 73", "PubChem CID 37270", Source)
+  )
+
+cat("FINAL SUMMARY\n")
+cat("Total compounds:", nrow(ec_final), "\n")
+cat("With MW:", sum(!is.na(ec_final$MW)), "\n")
+cat("With PSA:", sum(!is.na(ec_final$PSA)), "\n")
+cat("With LogP:", sum(!is.na(ec_final$LogP)), "\n")
+
+print(ec_final |> dplyr::select(Compound, ChEMBL_ID, MW, PSA, HBD, HBA, LogP, Source))
+```
+
+
+
+```{r load-opera-ec}
+opera_ec <- readr::read_csv("data/opera_ec_data.csv")
+
+cat("Rows:", nrow(opera_ec), "\n")
+cat("Columns:", ncol(opera_ec), "\n")
+print(names(opera_ec))
+```
+
+```{r merge-opera-ec}
+# Check what came back
+cat("Unique INPUT values:", length(unique(opera_ec$INPUT)), "\n")
+cat("Unique CASRN values:", length(unique(opera_ec$CASRN)), "\n")
+
+# Clean and deduplicate
+opera_ec_clean <- opera_ec |>
+  dplyr::select(
+    INPUT,
+    CASRN,
+    pKa_acid_pred = OPERA_PKAA_OPERA_PRED,
+    pKa_base_pred = OPERA_PKAB_OPERA_PRED,
+    LogD74_pred = LOGD7.4
+  ) |>
+  dplyr::mutate(
+    pKa_acid_pred = dplyr::na_if(pKa_acid_pred, "N/A"),
+    pKa_base_pred = dplyr::na_if(pKa_base_pred, "N/A"),
+    LogD74_pred = dplyr::na_if(LogD74_pred, "N/A"),
+    pKa_acid_pred = as.numeric(pKa_acid_pred),
+    pKa_base_pred = as.numeric(pKa_base_pred),
+    LogD74_pred = as.numeric(LogD74_pred)
+  ) |>
+  dplyr::distinct(CASRN, .keep_all = TRUE)
+
+cat("After deduplication:", nrow(opera_ec_clean), "rows\n")
+
+# Merge with ec_final by CAS
+ec_final <- ec_final |>
+  dplyr::left_join(opera_ec_clean |> dplyr::select(CASRN, pKa_acid_pred, pKa_base_pred, LogD74_pred),
+                   by = c("CAS" = "CASRN"))
+
+cat("\n=== OPERA MERGE SUMMARY ===\n")
+cat("Compounds with predicted pKa acid:", sum(!is.na(ec_final$pKa_acid_pred)), "/", nrow(ec_final), "\n")
+cat("Compounds with predicted pKa base:", sum(!is.na(ec_final$pKa_base_pred)), "/", nrow(ec_final), "\n")
+cat("Compounds with predicted LogD7.4:", sum(!is.na(ec_final$LogD74_pred)), "/", nrow(ec_final), "\n")
+
+print(ec_final |> dplyr::select(Compound, CAS, pKa_acid_pred, pKa_base_pred, LogD74_pred))
+```
+
+
+
+```{r type-and-save}
+ec_final <- ec_final |>
+  dplyr::mutate(
+    Type = dplyr::case_when(
+      !is.na(pKa_acid_pred) & !is.na(pKa_base_pred) ~ "AMPHOLYTE",
+      !is.na(pKa_acid_pred) & is.na(pKa_base_pred)  ~ "ACID",
+      is.na(pKa_acid_pred) & !is.na(pKa_base_pred)  ~ "BASE",
+      is.na(pKa_acid_pred) & is.na(pKa_base_pred)   ~ "NEUTRAL",
+      TRUE ~ NA_character_
+    )
+  )
+
+cat("TYPE SUMMARY\n")
+ec_final |> dplyr::count(Type) |> print()
+
+cat("\nFINAL DATASET SUMMARY\n")
+cat("Total compounds:", nrow(ec_final), "\n")
+cat("Columns:", ncol(ec_final), "\n")
+print(names(ec_final))
+
+saveRDS(ec_final, "data/ec_dataset.rds")
+readr::write_csv(ec_final, "data/ec_dataset.csv")
+cat("\nDataset saved!\n")
+```
+
