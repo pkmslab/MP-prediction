@@ -1,0 +1,147 @@
+---
+title: "EC-Small"
+output: html_notebook
+---
+
+
+```{r setup, message=FALSE, warning=FALSE}
+library(httr2)
+library(jsonlite)
+library(dplyr)
+library(stringr)
+library(readr)
+```
+
+```{r load-ec8}
+ec_data <- readr::read_csv("data/ec_8_data.csv")
+
+cat("Rows:", nrow(ec_data), "\n")
+cat("Columns:", ncol(ec_data), "\n")
+print(names(ec_data))
+print(ec_data)
+```
+
+```{r chembl-extraction, message=TRUE}
+chembl_results <- data.frame()
+
+for (i in 1:nrow(ec_data)) {
+  compound <- ec_data$EC[i]
+  inchikey <- ec_data$InChIKey[i]
+  
+  tryCatch({
+    url <- paste0("https://www.ebi.ac.uk/chembl/api/data/molecule/", inchikey)
+    
+    req <- httr2::request(url) |> httr2::req_headers(Accept = "application/json")
+    response <- httr2::req_perform(req)
+    parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+    
+    chembl_results <- dplyr::bind_rows(chembl_results,
+      data.frame(
+        Compound = compound,
+        ChEMBL_ID = parsed$molecule_chembl_id,
+        MW = parsed$molecule_properties$full_mwt,
+        PSA = parsed$molecule_properties$psa,
+        HBD = as.integer(parsed$molecule_properties$hbd),
+        HBA = as.integer(parsed$molecule_properties$hba),
+        LogP = parsed$molecule_properties$alogp
+      ))
+    message(paste("Found:", compound, "→", parsed$molecule_chembl_id))
+    
+  }, error = function(e) {
+    message(paste("No match for:", compound, "-", e$message))
+    chembl_results <<- dplyr::bind_rows(chembl_results,
+      data.frame(Compound = compound, ChEMBL_ID = NA,
+                 MW = NA, PSA = NA, HBD = NA, HBA = NA, LogP = NA))
+  })
+}
+
+cat("ChEMBL SUMMARY\n")
+cat("Matched:", sum(!is.na(chembl_results$ChEMBL_ID)), "/", nrow(chembl_results), "\n")
+print(chembl_results)
+```
+
+```{r pfhps-pubchem}
+# Get PFHpS from PubChem using CASRN
+url <- "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/375-92-8/property/MolecularWeight,XLogP,TPSA,HBondDonorCount,HBondAcceptorCount/JSON"
+
+req <- httr2::request(url)
+response <- httr2::req_perform(req)
+parsed <- jsonlite::fromJSON(httr2::resp_body_string(response), flatten = TRUE)
+print(parsed$PropertyTable$Properties)
+```
+
+```{r combine-all}
+# Add PFHpS manually from PubChem
+chembl_results <- chembl_results |>
+  dplyr::mutate(
+    MW   = ifelse(Compound == "PFHpS", "450.12", MW),
+    PSA  = ifelse(Compound == "PFHpS", "62.8", PSA),
+    HBD  = ifelse(Compound == "PFHpS", 1L, HBD),
+    HBA  = ifelse(Compound == "PFHpS", 18L, HBA),
+    LogP = ifelse(Compound == "PFHpS", "4.3", LogP),
+    ChEMBL_ID = ifelse(Compound == "PFHpS", "PubChem CID 67820", ChEMBL_ID)
+  )
+
+# Merge with original ec_data
+ec_final <- ec_data |>
+  dplyr::rename(Compound = EC, Fu_final = Fup) |>
+  dplyr::left_join(chembl_results, by = "Compound")
+
+cat("COMBINED SUMMARY\n")
+cat("Total compounds:", nrow(ec_final), "\n")
+cat("With MW:", sum(!is.na(ec_final$MW)), "\n")
+cat("With LogP:", sum(!is.na(ec_final$LogP)), "\n")
+print(ec_final |> dplyr::select(Compound, ChEMBL_ID, MW, PSA, HBD, HBA, LogP, Fu_final))
+```
+
+```{r check-opera-ec8-cols}
+opera_ec8 <- readxl::read_excel("data/opera_ec_8.xlsx", sheet = "Main Data")
+cat("Column names:\n")
+print(names(opera_ec8))
+```
+```{r merge-opera-ec8}
+opera_ec8_clean <- opera_ec8 |>
+  dplyr::select(
+    INPUT,
+    pKa_acid_pred = OPERA_PKAA_OPERA_PRED,
+    pKa_base_pred = OPERA_PKAB_OPERA_PRED,
+    LogD74_pred = LOGD7.4,
+    LogP_opera = OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED
+  )
+
+# Merge with ec_final by CASRN
+ec_final <- ec_final |>
+  dplyr::left_join(opera_ec8_clean, by = c("CASRN" = "INPUT"))
+
+cat("=== OPERA MERGE SUMMARY ===\n")
+cat("With pKa acid:", sum(!is.na(ec_final$pKa_acid_pred)), "/", nrow(ec_final), "\n")
+cat("With pKa base:", sum(!is.na(ec_final$pKa_base_pred)), "/", nrow(ec_final), "\n")
+cat("With LogD7.4:", sum(!is.na(ec_final$LogD74_pred)), "/", nrow(ec_final), "\n")
+
+print(ec_final |> dplyr::select(Compound, CASRN, pKa_acid_pred, pKa_base_pred, LogD74_pred, LogP_opera))
+```
+
+```{r type-and-save}
+ec_final <- ec_final |>
+  dplyr::mutate(
+    Type = dplyr::case_when(
+      !is.na(pKa_acid_pred) & !is.na(pKa_base_pred) ~ "AMPHOLYTE",
+      !is.na(pKa_acid_pred) & is.na(pKa_base_pred)  ~ "ACID",
+      is.na(pKa_acid_pred) & !is.na(pKa_base_pred)  ~ "BASE",
+      is.na(pKa_acid_pred) & is.na(pKa_base_pred)   ~ "NEUTRAL",
+      TRUE ~ NA_character_
+    )
+  )
+
+cat("=== TYPE SUMMARY ===\n")
+ec_final |> dplyr::count(Type) |> print()
+
+cat("\n=== FINAL DATASET ===\n")
+cat("Rows:", nrow(ec_final), "\n")
+cat("Columns:", ncol(ec_final), "\n")
+print(names(ec_final))
+
+saveRDS(ec_final, "data/ec_8_dataset.rds")
+readr::write_csv(ec_final, "data/ec_8_dataset.csv")
+cat("\nDataset saved!\n")
+```
