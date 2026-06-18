@@ -358,3 +358,88 @@ print(names(drug_data))
 methotrexate<- drug_data |> dplyr::filter(ChEMBL_ID == "CHEMBL34259")
 print(methotrexate)
 ```
+
+```{r compare-logp-pka}
+# Load OPERA data
+opera <- readr::read_csv("data/OPERA.csv") |>
+  dplyr::select(
+    INPUT,
+    LogP_opera = OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED
+  ) |>
+  dplyr::mutate(
+    LogP_opera = dplyr::na_if(LogP_opera, "N/A"),
+    LogP_opera = as.numeric(LogP_opera)
+  ) |>
+  dplyr::distinct(INPUT, .keep_all = TRUE)
+
+# Merge OPERA LogP into drug_data
+drug_data <- drug_data |>
+  dplyr::left_join(opera, by = c("Drug" = "INPUT"))
+
+# Calculate differences
+drug_data <- drug_data |>
+  dplyr::mutate(
+    LogP_chembl = as.numeric(LogP),
+    LogP_diff = abs(LogP_chembl - LogP_opera),
+    pKa_diff = abs(pKa_exp - pKa_acid_pred)
+  )
+
+cat("LogP COMPARISON (ChEMBL alogP vs OPERA)\n")
+cat("Drugs with both values:", sum(!is.na(drug_data$LogP_chembl) & !is.na(drug_data$LogP_opera)), "\n")
+cat("Mean absolute difference:", round(mean(drug_data$LogP_diff, na.rm = TRUE), 3), "\n")
+cat("Max difference:", round(max(drug_data$LogP_diff, na.rm = TRUE), 3), "\n")
+cat("Drugs with difference > 1:", sum(drug_data$LogP_diff > 1, na.rm = TRUE), "\n")
+
+cat("\npKa COMPARISON (ChEMBL experimental vs OPERA predicted)\n")
+cat("Drugs with both values:", sum(!is.na(drug_data$pKa_exp) & !is.na(drug_data$pKa_acid_pred)), "\n")
+cat("Mean absolute difference:", round(mean(drug_data$pKa_diff, na.rm = TRUE), 3), "\n")
+cat("Max difference:", round(max(drug_data$pKa_diff, na.rm = TRUE), 3), "\n")
+cat("Drugs with difference > 1:", sum(drug_data$pKa_diff > 1, na.rm = TRUE), "\n")
+
+cat("\nDRUGS WITH LARGE LogP DIFFERENCE (>1)\n")
+drug_data |>
+  dplyr::filter(LogP_diff > 1) |>
+  dplyr::select(Drug, LogP_chembl, LogP_opera, LogP_diff) |>
+  dplyr::arrange(desc(LogP_diff)) |>
+  print()
+
+cat("\n DRUGS WITH LARGE pKa DIFFERENCE (>2)\n")
+drug_data |>
+  dplyr::filter(pKa_diff > 2) |>
+  dplyr::select(Drug, pKa_exp, pKa_acid_pred, pKa_diff) |>
+  dplyr::arrange(desc(pKa_diff)) |>
+  print()
+```
+
+```{r add-logd-diff-and-save}
+drug_data <- drug_data |>
+  dplyr::mutate(
+    LogD74_diff = abs(as.numeric(LogD74_exp) - LogD74_pred)
+  )
+
+cat("LogD7.4 COMPARISON (ChEMBL experimental vs OPERA predicted)\n")
+cat("Drugs with both values:", sum(!is.na(drug_data$LogD74_diff)), "\n")
+cat("Mean absolute difference:", round(mean(drug_data$LogD74_diff, na.rm = TRUE), 3), "\n")
+cat("Max difference:", round(max(drug_data$LogD74_diff, na.rm = TRUE), 3), "\n")
+cat("Drugs with difference > 1:", sum(drug_data$LogD74_diff > 1, na.rm = TRUE), "\n")
+
+cat("\nDRUGS WITH LARGE LogD7.4 DIFFERENCE (>1)\n")
+drug_data |>
+  dplyr::filter(LogD74_diff > 1) |>
+  dplyr::select(Drug, LogD74_exp, LogD74_pred, LogD74_diff) |>
+  dplyr::arrange(desc(LogD74_diff)) |>
+  print()
+
+# Save final dataset with all comparison columns
+saveRDS(drug_data, "data/drug_data_complete.rds")
+readr::write_csv(drug_data, "data/drug_data_complete.csv")
+
+cat("\nDataset saved with all comparison columns\n")
+cat("Rows:", nrow(drug_data), "\n")
+cat("Columns:", ncol(drug_data), "\n")
+print(names(drug_data))
+```
+
+```{r}
+print(head(drug_data))
+```
