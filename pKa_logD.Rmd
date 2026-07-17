@@ -592,3 +592,61 @@ write_csv(drug_data, "data/drug_data_complete.csv")
 cat("Saved with", ncol(drug_data), "columns\n")
 ```
 
+``` {r}
+library(reticulate)
+use_condaenv("pka_prediction", required = TRUE)
+
+rdkit_chem <- import("rdkit.Chem")
+pkasolver_query <- import("pkasolver.query")
+
+drug_data <- readRDS("data/drug_data_complete.rds")
+
+get_pka_details <- function(smiles) {
+  tryCatch({
+    mol <- rdkit_chem$MolFromSmiles(smiles)
+    if (is.null(mol)) return(list(pka = NA, type = NA, n = 0))
+    
+    states <- pkasolver_query$calculate_microstate_pka_values(mol, only_dimorphite = FALSE)
+    
+    pka_vals <- c()
+    type_vals <- c()
+    
+    for (s in states) {
+      prot_charge <- s$protonated_mol$GetAtomWithIdx(as.integer(s$reaction_center_idx))$GetFormalCharge()
+      deprot_charge <- s$deprotonated_mol$GetAtomWithIdx(as.integer(s$reaction_center_idx))$GetFormalCharge()
+      
+      site_type <- if (prot_charge > deprot_charge && deprot_charge == 0) {
+        "BASE"
+      } else if (prot_charge == 0 && deprot_charge < 0) {
+        "ACID"
+      } else {
+        "OTHER"
+      }
+      
+      pka_vals <- c(pka_vals, round(s$pka, 3))
+      type_vals <- c(type_vals, site_type)
+    }
+    
+    list(
+      pka = paste(pka_vals, collapse = ", "),
+      type = paste(type_vals, collapse = ", "),
+      n = length(pka_vals)
+    )
+  }, error = function(e) list(pka = NA, type = NA, n = 0))
+}
+
+results <- lapply(drug_data$SMILES, get_pka_details)
+
+drug_data$Type_pkasolver <- sapply(results, function(x) x$type)
+
+
+cat("Drugs with pkasolver acid/base classification:", 
+    sum(!is.na(drug_data$Type_pkasolver)), "/", nrow(drug_data), "\n")
+```
+
+``` {r} 
+saveRDS(drug_data, "data/drug_data_complete.rds")
+readr::write_csv(drug_data, "data/drug_data_complete.csv")
+```
+
+
