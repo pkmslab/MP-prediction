@@ -441,5 +441,154 @@ print(names(drug_data))
 ```
 
 ```{r}
-print(head(drug_data))
+library(dplyr)
+
+drug_data <- readRDS("data/drug_data_complete.rds")
+
+pH <- 7.4
+
+# Function to calculate LogD using Henderson-Hasselbalch
+calc_logd <- function(logp, pka, type) {
+  case_when(
+    type == "ACID" ~ logp - log10(1 + 10^(pH - pka)),
+    type == "BASE" ~ logp - log10(1 + 10^(pka - pH)),
+    type == "AMPHOLYTE" ~ NA_real_,  # needs both pKa values - handle separately
+    type == "NEUTRAL" ~ logp,
+    TRUE ~ NA_real_
+  )
+}
+
+# LogD calculated using ChEMBL LogP + ChEMBL experimental pKa
+drug_data <- drug_data |>
+  mutate(
+    LogD74_calc_exp = case_when(
+      Type == "ACID" ~ LogP_chembl - log10(1 + 10^(pH - pKa_exp)),
+      Type == "BASE" ~ LogP_chembl - log10(1 + 10^(pKa_exp - pH)),
+      Type == "NEUTRAL" ~ LogP_chembl,
+      TRUE ~ NA_real_
+    )
+  )
+
+# LogD calculated using ChEMBL LogP + OPERA predicted pKa (acid or base)
+drug_data <- drug_data |>
+  mutate(
+    pKa_opera_relevant = case_when(
+      Type == "ACID" ~ pKa_acid_pred,
+      Type == "BASE" ~ pKa_base_pred,
+      TRUE ~ NA_real_
+    ),
+    LogD74_calc_opera = case_when(
+      Type == "ACID" ~ LogP_chembl - log10(1 + 10^(pH - pKa_acid_pred)),
+      Type == "BASE" ~ LogP_chembl - log10(1 + 10^(pKa_acid_pred - pH)),
+      Type == "NEUTRAL" ~ LogP_chembl,
+      TRUE ~ NA_real_
+    )
+  )
+
+# Fix BASE case - should use pKa_base_pred not pKa_acid_pred
+drug_data <- drug_data |>
+  mutate(
+    LogD74_calc_opera = case_when(
+      Type == "ACID" ~ LogP_chembl - log10(1 + 10^(pH - pKa_acid_pred)),
+      Type == "BASE" ~ LogP_chembl - log10(1 + 10^(pKa_base_pred - pH)),
+      Type == "NEUTRAL" ~ LogP_chembl,
+      TRUE ~ NA_real_
+    )
+  )
+
+cat("LogD CALCULATION SUMMARY\n")
+cat("LogD74_calc_exp available:", sum(!is.na(drug_data$LogD74_calc_exp)), "/", nrow(drug_data), "\n")
+cat("LogD74_calc_opera available:", sum(!is.na(drug_data$LogD74_calc_opera)), "/", nrow(drug_data), "\n")
+
+# Save
+saveRDS(drug_data, "data/drug_data_complete.rds")
+readr::write_csv(drug_data, "data/drug_data_complete.csv")
+cat("\nSaved with", ncol(drug_data), "columns\n")
 ```
+
+```{r}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+drug_data <- readRDS("data/drug_data_complete.rds")
+
+# Reshape to long format for combined plotting
+plot_data <- drug_data |>
+  filter(!is.na(LogD74_exp)) |>
+  select(Drug, LogD74_exp, LogD74_pred, LogD74_calc_exp, LogD74_calc_opera) |>
+  pivot_longer(cols = c(LogD74_pred, LogD74_calc_exp, LogD74_calc_opera),
+               names_to = "Source", values_to = "Value") |>
+  filter(!is.na(Value)) |>
+  mutate(Source = recode(Source,
+    LogD74_pred = "OPERA Predicted",
+    LogD74_calc_exp = "Calculated (ChEMBL pKa)",
+    LogD74_calc_opera = "Calculated (OPERA pKa)"
+  ))
+
+p_combined <- ggplot(plot_data, aes(x = LogD74_exp, y = Value, color = Source)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Experimental LogD7.4 vs Three Alternative Sources",
+       x = "Experimental LogD7.4 (ChEMBL)",
+       y = "Alternative LogD7.4 Value",
+       color = "Source") +
+  theme_minimal() +
+  scale_color_manual(values = c("OPERA Predicted" = "steelblue",
+                                 "Calculated (ChEMBL pKa)" = "darkgreen",
+                                 "Calculated (OPERA pKa)" = "darkorange"))
+
+print(p_combined)
+```
+
+``` {r}
+summary_table <- data.frame(
+  Source = c("OPERA Predicted", "Calculated (ChEMBL pKa)", "Calculated (OPERA pKa)"),
+  N = c(
+    sum(!is.na(drug_data$LogD74_exp) & !is.na(drug_data$LogD74_pred)),
+    sum(!is.na(drug_data$LogD74_exp) & !is.na(drug_data$LogD74_calc_exp)),
+    sum(!is.na(drug_data$LogD74_exp) & !is.na(drug_data$LogD74_calc_opera))
+  ),
+  Mean_Abs_Diff = c(
+    mean(abs(drug_data$LogD74_exp - drug_data$LogD74_pred), na.rm = TRUE),
+    mean(abs(drug_data$LogD74_exp - drug_data$LogD74_calc_exp), na.rm = TRUE),
+    mean(abs(drug_data$LogD74_exp - drug_data$LogD74_calc_opera), na.rm = TRUE)
+  ),
+  RMSE = c(
+    sqrt(mean((drug_data$LogD74_exp - drug_data$LogD74_pred)^2, na.rm = TRUE)),
+    sqrt(mean((drug_data$LogD74_exp - drug_data$LogD74_calc_exp)^2, na.rm = TRUE)),
+    sqrt(mean((drug_data$LogD74_exp - drug_data$LogD74_calc_opera)^2, na.rm = TRUE))
+  ),
+  Max_Diff = c(
+    max(abs(drug_data$LogD74_exp - drug_data$LogD74_pred), na.rm = TRUE),
+    max(abs(drug_data$LogD74_exp - drug_data$LogD74_calc_exp), na.rm = TRUE),
+    max(abs(drug_data$LogD74_exp - drug_data$LogD74_calc_opera), na.rm = TRUE)
+  ),
+  Correlation = c(
+    cor(drug_data$LogD74_exp, drug_data$LogD74_pred, use = "complete.obs"),
+    cor(drug_data$LogD74_exp, drug_data$LogD74_calc_exp, use = "complete.obs"),
+    cor(drug_data$LogD74_exp, drug_data$LogD74_calc_opera, use = "complete.obs")
+  )
+) |>
+  mutate(across(where(is.numeric), ~round(., 3)))
+
+print(summary_table)
+
+```
+
+``` {r}
+pkasolver <- read_csv("data/pkasolver_output.csv")
+
+# Merging
+drug_data <- drug_data |>
+  left_join(pkasolver, by = "Drug")
+
+cat("Drugs with pkasolver pKa:", sum(!is.na(drug_data$pKa_pkasolver)), "/", nrow(drug_data), "\n")
+
+```
+``` {r}
+saveRDS(drug_data, "data/drug_data_complete.rds")
+write_csv(drug_data, "data/drug_data_complete.csv")
+cat("Saved with", ncol(drug_data), "columns\n")
+```
+
