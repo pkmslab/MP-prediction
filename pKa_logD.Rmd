@@ -649,4 +649,200 @@ saveRDS(drug_data, "data/drug_data_complete.rds")
 readr::write_csv(drug_data, "data/drug_data_complete.csv")
 ```
 
+``` {r} 
+drug_data <- readRDS("data/drug_data_complete.rds")
+
+drug_data |>
+  dplyr::filter(N_pka_pkasolver > 1) |>
+  dplyr::select(Drug,pKa_pkasolver,N_pka_pkasolver) |>
+  as.data.frame() |>
+  print()
+```
+``` {r}
+library(dplyr)
+library(readr)
+library(stringr)
+
+drug_data <- readRDS("data/drug_data_complete.rds")
+
+pH <- 7.4
+
+calc_logd_pkasolver <- function(logp, pka_str, type_str) {
+  if (is.na(logp) || is.na(pka_str) || is.na(type_str)) return(NA_real_)
+  
+  pkas <- as.numeric(str_split(pka_str, ", ")[[1]])
+  types <- str_split(type_str, ", ")[[1]]
+  
+  # Filter out pKas more than 4 units from pH 7.4
+  keep <- abs(pkas - pH) <= 4
+  pkas <- pkas[keep]
+  types <- types[keep]
+  
+  if (length(pkas) == 0) return(logp)  # nothing relevant -> treat as neutral
+  
+  acid_pkas <- sort(pkas[types == "ACID"])
+  base_pkas <- sort(pkas[types == "BASE"], decreasing = TRUE)
+  
+  # fraction neutral for acid side 
+  if (length(acid_pkas) == 0) {
+    f_acid <- 1
+  } else if (length(acid_pkas) == 1) {
+    f_acid <- 1 / (1 + 10^(pH - acid_pkas[1]))
+  } else {
+    pka1 <- acid_pkas[1]
+    pka2 <- acid_pkas[2]
+    f_acid <- 1 / (1 + 10^(pH - pka1) + 10^(2*pH - pka1 - pka2))
+  }
+  
+  # fraction neutral for base side 
+  if (length(base_pkas) == 0) {
+    f_base <- 1
+  } else if (length(base_pkas) == 1) {
+    f_base <- 1 / (1 + 10^(base_pkas[1] - pH))
+  } else {
+    pka1 <- base_pkas[1]
+    pka2 <- base_pkas[2]
+    f_base <- 1 / (1 + 10^(pka1 - pH) + 10^(pka1 + pka2 - 2*pH))
+  }
+  
+  f_neutral <- f_acid * f_base
+  
+  logd <- logp + log10(f_neutral)
+  return(logd)
+}
+
+drug_data <- drug_data |>
+  rowwise() |>
+  mutate(
+    LogD74_calc_pkasolver = calc_logd_pkasolver(LogP_chembl, pKa_pkasolver, Type_pkasolver)
+  ) |>
+  ungroup()
+
+cat("LogD from pkasolver pKa\n")
+cat("Available:", sum(!is.na(drug_data$LogD74_calc_pkasolver)), "/", nrow(drug_data), "\n")
+
+saveRDS(drug_data, "data/drug_data_complete.rds")
+write_csv(drug_data, "data/drug_data_complete.csv")
+```
+``` {r}
+library(ggplot2)
+
+drug_data <- readRDS("data/drug_data_complete.rds")
+
+compare_data <- drug_data |>
+  filter(!is.na(LogD74_calc_opera), !is.na(LogD74_calc_pkasolver))
+
+cat("Drugs with both OPERA-derived and pkasolver-derived LogD:", nrow(compare_data), "\n")
+
+# Fit linear regression
+model <- lm(LogD74_calc_pkasolver ~ LogD74_calc_opera, data = compare_data)
+r_squared <- summary(model)$r.squared
+cat("R-squared:", round(r_squared, 3), "\n")
+
+p <- ggplot(compare_data, aes(x = LogD74_calc_opera, y = LogD74_calc_pkasolver)) +
+  geom_point(alpha = 0.6, color = "purple") +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "LogD7.4 Calculated: OPERA pKa vs pkasolver pKa",
+       subtitle = paste0("R² = ", round(r_squared, 3), " (blue = fitted regression, red = y=x)"),
+       x = "LogD7.4 (calculated using OPERA pKa)",
+       y = "LogD7.4 (calculated using pkasolver pKa)") +
+  theme_minimal()
+
+ggsave("data/plot_logd_opera_vs_pkasolver.png", p, width = 7, height = 6)
+print(p)
+```
+
+``` {r}
+library(dplyr)
+library(stringr)
+
+drug_data <- readRDS("data/drug_data_complete.rds")
+
+get_relevant_pkasolver_pka <- function(pka_str, type_str, drug_type) {
+  if (is.na(pka_str) || is.na(type_str)) return(NA_real_)
+  
+  pkas <- as.numeric(str_split(pka_str, ", ")[[1]])
+  types <- str_split(type_str, ", ")[[1]]
+  
+  if (drug_type == "ACID") {
+    acid_pkas <- pkas[types == "ACID"]
+    if (length(acid_pkas) == 0) return(NA_real_)
+    return(min(acid_pkas))  # lowest acidic pKa
+  } else if (drug_type == "BASE") {
+    base_pkas <- pkas[types == "BASE"]
+    if (length(base_pkas) == 0) return(NA_real_)
+    return(max(base_pkas))  # highest basic pKa
+  } else {
+    return(NA_real_)
+  }
+}
+
+drug_data <- drug_data |>
+  rowwise() |>
+  mutate(
+    pKa_pkasolver_relevant = get_relevant_pkasolver_pka(pKa_pkasolver, Type_pkasolver, Type)
+  ) |>
+  ungroup()
+
+cat("Drugs with pKa_pkasolver_relevant:", sum(!is.na(drug_data$pKa_pkasolver_relevant)), "/", nrow(drug_data), "\n")
+
+saveRDS(drug_data, "data/drug_data_complete.rds")
+readr::write_csv(drug_data, "data/drug_data_complete.csv")
+```
+
+``` {r}
+library(ggplot2)
+
+drug_data <- readRDS("data/drug_data_complete.rds")
+
+compare_pka <- drug_data |>
+  filter(!is.na(pKa_opera_relevant), !is.na(pKa_pkasolver_relevant))
+
+cat("Drugs with both OPERA and pkasolver relevant pKa:", nrow(compare_pka), "\n")
+
+# Fit linear regression
+model_pka <- lm(pKa_pkasolver_relevant ~ pKa_opera_relevant, data = compare_pka)
+r_squared_pka <- summary(model_pka)$r.squared
+cat("R-squared:", round(r_squared_pka, 3), "\n")
+
+p_pka <- ggplot(compare_pka, aes(x = pKa_opera_relevant, y = pKa_pkasolver_relevant)) +
+  geom_point(alpha = 0.6, color = "darkgreen") +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "pKa Comparison: OPERA vs pkasolver",
+       subtitle = paste0("R² = ", round(r_squared_pka, 3), " (blue = fitted regression, red = y=x)"),
+       x = "OPERA Predicted pKa (relevant)",
+       y = "pkasolver Predicted pKa (relevant)") +
+  theme_minimal()
+
+ggsave("data/plot_pka_opera_vs_pkasolver.png", p_pka, width = 7, height = 6)
+print(p_pka)
+```
+
+``` {r} 
+pka_summary <- data.frame(
+  Comparison = "pKa (OPERA vs pkasolver)",
+  N = nrow(compare_pka),
+  R_squared = round(r_squared_pka, 3),
+  Mean_Abs_Diff = round(mean(abs(compare_pka$pKa_opera_relevant - compare_pka$pKa_pkasolver_relevant), na.rm = TRUE), 3),
+  RMSE = round(sqrt(mean((compare_pka$pKa_opera_relevant - compare_pka$pKa_pkasolver_relevant)^2, na.rm = TRUE)), 3)
+)
+
+logd_pkasolver_summary <- data.frame(
+  Comparison = "LogD7.4 (OPERA-derived vs pkasolver-derived)",
+  N = nrow(compare_data),
+  R_squared = round(r_squared, 3),
+  Mean_Abs_Diff = round(mean(abs(compare_data$LogD74_calc_opera - compare_data$LogD74_calc_pkasolver), na.rm = TRUE), 3),
+  RMSE = round(sqrt(mean((compare_data$LogD74_calc_opera - compare_data$LogD74_calc_pkasolver)^2, na.rm = TRUE)), 3)
+)
+
+final_summary <- dplyr::bind_rows(pka_summary, logd_pkasolver_summary)
+print(final_summary)
+
+write.csv(final_summary, "data/opera_vs_pkasolver_summary.csv", row.names = FALSE)
+
+saveRDS(drug_data, "data/drug_data_complete.rds")
+readr::write_csv(drug_data, "data/drug_data_complete.csv")
+```
 
