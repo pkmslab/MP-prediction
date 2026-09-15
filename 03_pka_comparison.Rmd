@@ -1,0 +1,212 @@
+---
+title: "03 — pKa method comparison dataset"
+output: html_notebook
+---
+
+## Purpose
+
+Builds the smaller side dataset `data/pka_comparison.rds`, holding the acid and
+base pKa for each drug from four sources:
+
+| Source | Where it comes from |
+|---|---|
+| pkasolver v2 | already in the main dataset (notebook 02) |
+| OPERA | already in the main dataset (notebook 01) |
+| MolGpKa | fetched here from the xundrug API |
+| Uni-pKa | `unipka_predict.py`, run separately |
+
+Nothing here is written back into the main dataset . it is a comparison table
+only. Run after `01` and `02`.
+
+All four sources are filtered to pKa 3–11; acid takes the lowest value in
+range, base the highest.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(httr2)
+library(jsonlite)
+library(dplyr)
+library(readr)
+
+MAIN_RDS  <- "data/new_drug_dataset.rds"
+UNIPKA_CSV <- "data/unipka_macro_pka.csv"
+OUT_RDS   <- "data/pka_comparison.rds"
+OUT_CSV   <- "data/pka_comparison.csv"
+
+PKA_MIN <- 3
+PKA_MAX <- 11
+
+drug_data <- readRDS(MAIN_RDS)
+cat("Main dataset:", nrow(drug_data), "drugs\n")
+```
+
+## 1. MolGpKa
+
+Undocumented batch endpoint; one molecule per request, so the loop is paced to
+avoid rate limiting and failures are retried once with a longer pause.
+
+```{r molgpka-function}
+MOLGPKA_URL   <- "http://xundrug.cn:5001/modules/upload0/"
+MOLGPKA_TOKEN <- "O05DriqqQLlry9kmpCwms2IJLC0MuLQ7"
+
+get_molgpka <- function(smiles) {
+  tryCatch({
+    temp_file <- tempfile(fileext = ".txt")
+    on.exit(unlink(temp_file), add = TRUE)
+    writeLines(smiles, temp_file, sep = "")
+
+    result <- httr2::request(MOLGPKA_URL) |>
+      httr2::req_headers(token = MOLGPKA_TOKEN) |>
+      httr2::req_body_multipart(Smiles = curl::form_file(temp_file, name = "tmg")) |>
+      httr2::req_perform() |>
+      httr2::resp_body_json()
+
+    list(acid = result$gen_datas$Acid, base = result$gen_datas$Base)
+  }, error = function(e) {
+    message("MolGpKa error: ", e$message)
+    list(acid = NULL, base = NULL)
+  })
+}
+
+# Turn one API response into a single row
+molgpka_row <- function(drug, result) {
+  acid_nums <- if (length(result$acid) > 0) as.numeric(unlist(result$acid)) else numeric(0)
+  base_nums <- if (length(result$base) > 0) as.numeric(unlist(result$base)) else numeric(0)
+
+  acid_in_range <- acid_nums[acid_nums >= PKA_MIN & acid_nums <= PKA_MAX]
+  base_in_range <- base_nums[base_nums >= PKA_MIN & base_nums <= PKA_MAX]
+
+  data.frame(
+    Drug                 = drug,
+    molgpka_acid_raw     = if (length(acid_nums) > 0) paste(acid_nums, collapse = ", ") else NA_character_,
+    molgpka_base_raw     = if (length(base_nums) > 0) paste(base_nums, collapse = ", ") else NA_character_,
+    molgpka_acid_N       = length(acid_nums),
+    molgpka_base_N       = length(base_nums),
+    molgpka_pKa_acid     = if (length(acid_in_range) > 0) min(acid_in_range) else NA_real_,
+    molgpka_pKa_base     = if (length(base_in_range) > 0) max(base_in_range) else NA_real_,
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+```{r molgpka-extraction, message=TRUE}
+molgpka_results <- dplyr::bind_rows(lapply(seq_len(nrow(drug_data)), function(i) {
+  drug   <- drug_data$Drug[i]
+  smiles <- drug_data$SMILES[i]
+
+  if (is.na(smiles)) return(molgpka_row(drug, list(acid = NULL, base = NULL)))
+
+  row <- molgpka_row(drug, get_molgpka(smiles))
+  message(i, "/", nrow(drug_data), " - ", drug)
+  Sys.sleep(1)
+  row
+}))
+
+cat("MolGpKa acid (raw):", sum(!is.na(molgpka_results$molgpka_acid_raw)), "\n")
+cat("MolGpKa base (raw):", sum(!is.na(molgpka_results$molgpka_base_raw)), "\n")
+```
+
+```{r molgpka-retry, message=TRUE}
+# Drugs that returned nothing at all are usually rate limiting, not real
+# absences - retry once at a slower pace.
+failed <- molgpka_results |>
+  dplyr::filter(is.na(molgpka_acid_raw), is.na(molgpka_base_raw)) |>
+  dplyr::pull(Drug)
+
+cat("Retrying:", length(failed), "drugs\n")
+
+for (drug in failed) {
+  smiles <- drug_data$SMILES[drug_data$Drug == drug]
+  if (length(smiles) == 0 || is.na(smiles)) next
+
+  row <- molgpka_row(drug, get_molgpka(smiles))
+  if (!is.na(row$molgpka_acid_raw) || !is.na(row$molgpka_base_raw)) {
+    molgpka_results[molgpka_results$Drug == drug, names(row)] <- row
+    message(drug, " - recovered")
+  }
+  Sys.sleep(5)
+}
+
+cat("Still empty after retry:",
+    sum(is.na(molgpka_results$molgpka_acid_raw) & is.na(molgpka_results$molgpka_base_raw)), "\n")
+```
+
+## 2. Uni-pKa
+
+Produced by `unipka_predict.py`, which runs in the `unipka` environment (not
+the `pka_prediction` one)  If the file is not there yet, the Uni-pKa columns come through as NA.
+
+```{r unipka-load}
+if (file.exists(UNIPKA_CSV)) {
+  unipka_results <- readr::read_csv(UNIPKA_CSV, show_col_types = FALSE) |>
+    dplyr::select(
+      Drug,
+      unipka_pKa_acid = unipka_acidic_macro_pKa,
+      unipka_pKa_base = unipka_basic_macro_pKa
+    )
+  cat("Uni-pKa acid:", sum(!is.na(unipka_results$unipka_pKa_acid)), "\n")
+  cat("Uni-pKa base:", sum(!is.na(unipka_results$unipka_pKa_base)), "\n")
+} else {
+  warning("Uni-pKa file not found - run unipka_predict.py. Columns will be NA.")
+  unipka_results <- data.frame(
+    Drug = drug_data$Drug,
+    unipka_pKa_acid = NA_real_,
+    unipka_pKa_base = NA_real_,
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+## 3. Assemble the comparison dataset
+
+```{r build-comparison}
+pka_comparison <- drug_data |>
+  dplyr::select(
+    Drug, SMILES, Type,
+    pkasolver_pKa_acid = pKa_acid_v2,
+    pkasolver_pKa_base = pKa_base_v2,
+    pkasolver_FG_acid  = FG_acid_v2,
+    pkasolver_FG_base  = FG_base_v2,
+    opera_pKa_acid     = pKa_acid_pred,
+    opera_pKa_base     = pKa_base_pred,
+    pKa_exp
+  ) |>
+  dplyr::left_join(molgpka_results, by = "Drug") |>
+  dplyr::left_join(unipka_results, by = "Drug") |>
+  dplyr::select(
+    Drug, SMILES, Type, pKa_exp,
+    pkasolver_pKa_acid, opera_pKa_acid, molgpka_pKa_acid, unipka_pKa_acid,
+    pkasolver_pKa_base, opera_pKa_base, molgpka_pKa_base, unipka_pKa_base,
+    pkasolver_FG_acid, pkasolver_FG_base,
+    molgpka_acid_raw, molgpka_base_raw, molgpka_acid_N, molgpka_base_N
+  )
+
+saveRDS(pka_comparison, OUT_RDS)
+readr::write_csv(pka_comparison, OUT_CSV)
+
+cat("Saved:", nrow(pka_comparison), "rows x", ncol(pka_comparison), "columns\n")
+```
+
+## 4. Coverage
+
+How many drugs each method returns an in-range pKa for.
+
+```{r coverage}
+coverage <- data.frame(
+  Method = c("pkasolver v2", "OPERA", "MolGpKa", "Uni-pKa"),
+  N_acid = c(
+    sum(!is.na(pka_comparison$pkasolver_pKa_acid)),
+    sum(!is.na(pka_comparison$opera_pKa_acid)),
+    sum(!is.na(pka_comparison$molgpka_pKa_acid)),
+    sum(!is.na(pka_comparison$unipka_pKa_acid))
+  ),
+  N_base = c(
+    sum(!is.na(pka_comparison$pkasolver_pKa_base)),
+    sum(!is.na(pka_comparison$opera_pKa_base)),
+    sum(!is.na(pka_comparison$molgpka_pKa_base)),
+    sum(!is.na(pka_comparison$unipka_pKa_base))
+  )
+)
+coverage$N_drugs <- nrow(pka_comparison)
+
+print(coverage)
+```

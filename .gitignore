@@ -1,5 +1,18 @@
-.Rproj.user
+# macOS
+.DS_Store
+
+# RStudio / R session state
+.Rproj.user/
 .Rhistory
 .RData
 .Ruserdata
+
+# Knitted notebook previews 
 *.nb.html
+
+# Cleanup holding folders
+_to_delete/
+
+# Python
+__pycache__/
+*.pyc
