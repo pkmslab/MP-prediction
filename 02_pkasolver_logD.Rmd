@@ -1,35 +1,34 @@
 ---
-title: "02 — pkasolver pKa, LogD7.4 and fraction neutral"
+title: "02 — pkasolver pKa and calculated LogD7.4"
 output: html_notebook
 ---
 
 ## Purpose
 
-Adds the pkasolver pKa columns and the values calculated from them to the main
-dataset `data/new_drug_dataset.rds`. Run after `01_dataset_properties.Rmd`.
+Adds the pkasolver pKa values and the calculated LogD7.4 to the main dataset
+`data/new_drug_dataset.rds`. Run after `01_dataset_properties.Rmd`.
+Please restart session once after running 01 and before running 02.
 
-Columns added:
 
 | Column | Meaning |
 |---|---|
-| `pKa_pkasolver` | every predicted pKa, comma separated, in site order |
-| `N_pka_pkasolver` | number of ionisable sites found |
-| `Type_pkasolver` | ACID / BASE / OTHER per site, same order |
-| `pKa_acid_v1`, `pKa_base_v1` | selection over all sites classified in range 3–11 |
-| `pKa_acid_v2`, `pKa_base_v2` | **v2** — same, restricted to SMARTS-identified groups |
-| `FG_acid_v2`, `FG_base_v2` | functional group behind each v2 pKa |
-| `f_neutral_v2` | fraction neutral at pH 7.4 from the v2 pKa values |
-| `fraction_ionized_v2` | `1 - f_neutral_v2` |
-| `LogD74_calc_pkasolver_v2` | `LogP_chembl + log10(f_neutral_v2)` |
+| `pKa_acid` | lowest pKa among acidic sites in range 3–11 with a SMARTS-identified functional group (the former `pKa_acid_v2`) |
+| `pKa_base` | highest pKa among basic sites in range 3–11 with a SMARTS-identified functional group (the former `pKa_base_v2`) |
+| `LogD74_pred` | `LogP + log10(f_neutral)` at pH 7.4, calculated from `pKa_acid` and `pKa_base` |
 
-Acidic sites take the lowest pKa in range, basic sites the highest.
+The full set of intermediate values (every predicted site, the v1 selection,
+the functional groups, `f_neutral`, `fraction_ionized`) is still computed
+below for the checks, but is dropped before saving. The final dataset is:
+
+`Drug, ChEMBL_ID, MW, PSA, HBD, HBA, LogP, SMILES, Source, Fu_values, Fu_from_PPB, pKa_acid, pKa_base, LogD74_pred`
+
 Classification logic lives in `pka_classification.py`.
 
-> **Run this in a fresh R session.** Notebook 01 loads `rdkitpyr`, which
-> initialises reticulate against its own Python. Once Python is initialised in
-> an R session the environment cannot be switched, so `use_condaenv()` here
-> will fail. Restart R after 01 : nothing is lost, since 01 writes everything
-> to disk and this notebook reads it back.
+> **Run this in a fresh R session if anything else has started Python.**
+> Once Python is initialised in an R session the environment cannot be
+> switched, so `use_condaenv()` here would fail. Notebook 01 no longer loads
+> `rdkitpyr`, so it does not start Python and a restart is normally not needed;
+> the check below stays as a safeguard.
 
 ```{r setup, message=FALSE, warning=FALSE}
 library(reticulate)
@@ -39,9 +38,9 @@ library(readr)
 # Fail with an explanation rather than reticulate's "failed to initialize
 # requested version of Python", which does not say what actually went wrong.
 if (reticulate::py_available(initialize = FALSE)) {
-  stop("Python is already initialised in this R session , most likely by ",
-       "rdkitpyr in notebook 01. reticulate cannot switch environments after ",
-       "initialisation. Restart R (Session > Restart R) and run this notebook ",
+  stop("Python is already initialised in this R session. ",
+       "reticulate cannot switch environments after initialisation. ",
+       "Restart R (Session > Restart R) and run this notebook ",
        "first in the fresh session.", call. = FALSE)
 }
 
@@ -69,7 +68,9 @@ nz_int <- function(x) if (is.null(x) || length(x) == 0) 0L else as.integer(x)
 
 PKA_COLS <- c("pKa_pkasolver", "N_pka_pkasolver", "Type_pkasolver",
               "pKa_acid_v1", "pKa_base_v1", "pKa_acid_v2", "pKa_base_v2",
-              "FG_acid_v2", "FG_base_v2")
+              "FG_acid_v2", "FG_base_v2",
+              # final columns from a previous run
+              "pKa_acid", "pKa_base", "LogD74_pred")
 
 # Drop any previous run so the notebook is safe to re-run
 drug_data <- drug_data |> dplyr::select(-dplyr::any_of(PKA_COLS))
@@ -124,9 +125,7 @@ cat("v2 acid / base:  ", sum(!is.na(drug_data$pKa_acid_v2)), "/",
 
 ## 2. Silent-failure check
 
-Sites found but neither v1 value set means the classification returned nothing
-usable — the pattern that hid the earlier `process_drug_batch` bug. This should
-print zero rows.
+This should print zero rows.
 
 ```{r silent-failure-check}
 suspicious <- drug_data |>
@@ -156,7 +155,7 @@ drug_data <- drug_data |>
     # A drug with no SMILES was never assessed at all, which is not the same as
     # a drug pkasolver assessed and found no ionisable site in. Without this
     # guard both pKa terms are absent, f_neutral comes out as exactly 1 and
-    # fraction_ionized as 0 - reading as "confirmed neutral" when the truth is
+    # fraction_ionized as 0 , reading as "confirmed neutral" when the truth is
     # "unknown". Rows that were assessed and genuinely have no site keep f = 1,
     # which is correct for them.
     .assessed = !is.na(SMILES),
@@ -167,8 +166,8 @@ drug_data <- drug_data |>
         ifelse(!is.na(pKa_base_v2), 10^(pKa_base_v2 - pH), 0)),
       NA_real_
     ),
-    fraction_ionized_v2      = 1 - f_neutral_v2,
-    LogD74_calc_pkasolver_v2 = LogP_chembl + log10(f_neutral_v2)
+    fraction_ionized_v2 = 1 - f_neutral_v2,
+    LogD74_pred         = LogP + log10(f_neutral_v2)
   ) |>
   dplyr::select(-.assessed)
 
@@ -178,20 +177,38 @@ if (length(not_assessed) > 0) {
       paste(not_assessed, collapse = ", "), "\n\n")
 }
 
-cat("f_neutral_v2:             ", sum(!is.na(drug_data$f_neutral_v2)), "/", nrow(drug_data), "\n")
-cat("fraction_ionized_v2:      ", sum(!is.na(drug_data$fraction_ionized_v2)), "/", nrow(drug_data), "\n")
-cat("LogD74_calc_pkasolver_v2: ", sum(!is.na(drug_data$LogD74_calc_pkasolver_v2)), "/", nrow(drug_data), "\n\n")
+cat("f_neutral_v2:        ", sum(!is.na(drug_data$f_neutral_v2)), "/", nrow(drug_data), "\n")
+cat("fraction_ionized_v2: ", sum(!is.na(drug_data$fraction_ionized_v2)), "/", nrow(drug_data), "\n")
+cat("LogD74_pred:         ", sum(!is.na(drug_data$LogD74_pred)), "/", nrow(drug_data), "\n\n")
 
 cat("fraction_ionized_v2 distribution:\n")
 print(summary(drug_data$fraction_ionized_v2))
 ```
 
-## 4. Save
+## 4. Final columns
+
+Renames the v2 pKa values to `pKa_acid` / `pKa_base` and keeps only the columns
+the dataset needs. Everything else computed above (the raw site list, v1
+values, functional groups, `f_neutral_v2`, `fraction_ionized_v2`) is dropped.
+
+```{r final-columns}
+final_cols <- c("Drug", "ChEMBL_ID", "MW", "PSA", "HBD", "HBA", "LogP",
+                "SMILES", "Source", "Fu_values", "Fu_from_PPB",
+                "pKa_acid", "pKa_base", "LogD74_pred")
+
+drug_data <- drug_data |>
+  dplyr::mutate(pKa_acid = pKa_acid_v2, pKa_base = pKa_base_v2) |>
+  dplyr::select(dplyr::all_of(final_cols))
+
+cat("Final columns:", paste(names(drug_data), collapse = ", "), "\n")
+```
+
+## 5. Save
 
 ```{r save}
 saveRDS(drug_data, MAIN_RDS)
 readr::write_csv(drug_data, MAIN_CSV)
 
 cat("MAIN DATASET COMPLETE :", nrow(drug_data), "rows x", ncol(drug_data), "columns\n")
-cat("Next: run 03_pka_comparison.Rmd for the pKa method comparison dataset\n")
+cat("Next: run 03_pka_comparison.Rmd for the pKa method comparison dataset if needed.\n")
 ```

@@ -1,5 +1,5 @@
 ---
-title: "01 — Dataset properties (ChEMBL, PubChem, OPERA, RDKit)"
+title: "01 — Dataset properties (ChEMBL, PubChem)"
 output: html_notebook
 ---
 
@@ -7,26 +7,23 @@ output: html_notebook
 
 Builds the main dataset `data/new_drug_dataset.rds` from the drug list.
 
-Run order: **01 -> 02 -> 03**. This notebook is the only place molecular
-properties enter the dataset; 02 adds pkasolver pKa and the calculated
-LogD/fraction values, 03 builds the separate pKa comparison dataset.
+Run order: **01 -> 02**. This notebook is the only place molecular properties
+and Fu values enter the dataset; 02 adds the pkasolver pKa values (acid and
+base) and the calculated LogD7.4. Please restart session once before moving on to 02
+
+Final columns written by this notebook:
+
+`Drug, ChEMBL_ID, MW, PSA, HBD, HBA, LogP, SMILES, Source, Fu_values, Fu_from_PPB`
 
 | Block | Source | Columns added |
 |---|---|---|
-| 1 | `data/Drug_list.xlsx` | `Drug` |
-| 2 | ChEMBL molecule API | `ChEMBL_ID, MW, PSA, HBD, HBA, LogP, SMILES` |
+| 1 | `Drug_new.xlsx` | `Drug` |
+| 2 | ChEMBL molecule API | `ChEMBL_ID, MW, PSA, HBD, HBA, LogP, SMILES, Source` |
 | 3 | PubChem PUG REST | fills the above where ChEMBL has no match |
 | 4 | manual corrections | fixes for drugs neither API resolves correctly |
-| 5 | ChEMBL activity API | `Fu_median, N_fu, Fu_values` |
-| 6 | ChEMBL activity API | `PPB_value, Fu_from_PPB, N_ppb, Fu_source, Fu_final` |
-| 7 | ChEMBL activity API | `pKa_exp, N_pka, pKa_values` |
-| 8 | ChEMBL activity API | `LogD74_exp, N_logd, LogD_values` |
-| 9 | OPERA / EPA CompTox | `pKa_acid_pred, pKa_base_pred, LogD74_pred, LogP_opera, Type` |
-| 10 | RDKit | `MW_rdkit, PSA_rdkit, HBD_rdkit, HBA_rdkit, LogP_rdkit` + `*_diff_rdkit` |
-
-Block 9 needs a manual step: the `.csv` written in 9a is uploaded to the EPA
-CompTox batch-search dashboard, and its result is saved back as
-`data/new_opera_output.csv` before 9b is run.
+| 5 | ChEMBL activity API | `Fu_values` (all human Fu values; the median is used internally for the PPB check) |
+| 6 | ChEMBL activity API | `Fu_from_PPB` (only for drugs with no Fu value) |
+| 7 | — | keeps only the final columns |
 
 ```{r setup, message=FALSE, warning=FALSE}
 library(httr2)
@@ -35,7 +32,6 @@ library(dplyr)
 library(stringr)
 library(readr)
 library(readxl)
-library(rdkitpyr)
 
 MAIN_RDS <- "data/new_drug_dataset.rds"
 MAIN_CSV <- "data/new_drug_dataset.csv"
@@ -51,9 +47,9 @@ save_main <- function(df) {
 ## 1. Drug list
 
 ```{r drug-list}
-drug_list <- readxl::read_excel("data/Drug_list.xlsx") |>
+drug_list <- readxl::read_excel("Drug_new.xlsx") |>
   dplyr::mutate(
-    # Typos in the source spreadsheet
+    # Typos in the initial spreadsheet
     Drug = dplyr::case_when(
       Drug == "Apixabam" ~ "Apixaban",
       Drug == "Zalepon"  ~ "Zaleplon",
@@ -62,9 +58,7 @@ drug_list <- readxl::read_excel("data/Drug_list.xlsx") |>
   ) |>
   dplyr::distinct(Drug)
 
-# Names to query the databases under, where the list's label is not what
-# ChEMBL/PubChem calls the compound. The Drug column itself never changes, so
-# the OPERA join and every downstream file keep working.
+# Some common mismatches
 lookup_aliases <- c(
   "Ethanol"             = "Alcohol",
   "Dronabinol/THC"      = "Dronabinol",
@@ -112,7 +106,7 @@ fetch_chembl_molecule <- function(drug, query = drug) {
     return(NULL)
   }
 
-  # Exact name match only. Never fall back to the first search result
+  # Exact name match only. Never fall back to the first search result(somtimes its something else)
   match <- molecules |>
     dplyr::filter(tolower(pref_name) == tolower(query)) |>
     dplyr::slice(1)
@@ -256,7 +250,7 @@ Drugs where the API lookups return the wrong record or an incomplete one.
 Values are literature/PubChem-confirmed. `NA` means "leave whatever is there".
 
 These are applied **before** the activity queries so the corrected
-`ChEMBL_ID` is the one used for Fu, pKa and LogD.
+`ChEMBL_ID` is the one used for Fu.
 
 ```{r manual-corrections}
 manual_fixes <- tibble::tribble(
@@ -288,9 +282,8 @@ drug_data |>
   dplyr::select(Drug, ChEMBL_ID, MW, PSA, HBD, HBA, LogP) |>
   print()
 
-# SMILES is required downstream by OPERA, RDKit and pkasolver - a drug without
-# one drops out of every prediction column. The deliberately unresolved rows are
-# expected to be missing
+# SMILES is required downstream by pkasolver - a drug without one gets no pKa
+# or LogD. The deliberately unresolved rows are expected to be missing
 no_smiles  <- drug_data |> dplyr::filter(is.na(SMILES)) |> dplyr::pull(Drug)
 unexpected <- setdiff(no_smiles, names(leave_unmatched))
 expected   <- intersect(no_smiles, names(leave_unmatched))
@@ -310,9 +303,9 @@ save_main(drug_data)
 
 ## 5. Fu — fraction unbound in plasma
 
-Human assays only; animal and tissue assays excluded; values constrained to
-`[0, 1]`. Multiple values are summarised as the median and the raw values are
-kept in `Fu_values`.
+Only human assays are kept , animal and tissue assays excluded. Values are constrained to
+`[0, 1]`. All values are kept in `Fu_values`. The median (`Fu_median`) is only
+used internally in block 6, to decide which drugs still need the PPB fallback.
 
 ```{r fu-extraction, message=TRUE}
 ANIMAL_RX <- "\\brat\\b|\\bmouse\\b|\\bmice\\b|\\banimal\\b|\\brabbit\\b|\\bdog\\b|\\bmonkey\\b"
@@ -349,7 +342,7 @@ human_plasma_filter <- function(activities, lo, hi) {
 fu_results <- dplyr::bind_rows(lapply(seq_len(nrow(drug_data)), function(i) {
   drug      <- drug_data$Drug[i]
   chembl_id <- drug_data$ChEMBL_ID[i]
-  blank <- data.frame(Drug = drug, Fu_median = NA_real_, N_fu = 0L,
+  blank <- data.frame(Drug = drug, Fu_median = NA_real_,
                       Fu_values = NA_character_, stringsAsFactors = FALSE)
 
   if (is.na(chembl_id)) return(blank)
@@ -364,7 +357,6 @@ fu_results <- dplyr::bind_rows(lapply(seq_len(nrow(drug_data)), function(i) {
     data.frame(
       Drug      = drug,
       Fu_median = median(filtered$standard_value, na.rm = TRUE),
-      N_fu      = nrow(filtered),
       Fu_values = paste(filtered$standard_value, collapse = ", "),
       stringsAsFactors = FALSE
     )
@@ -376,13 +368,15 @@ fu_results <- dplyr::bind_rows(lapply(seq_len(nrow(drug_data)), function(i) {
 
 drug_data <- drug_data |> dplyr::left_join(fu_results, by = "Drug")
 
-cat("Drugs with Fu:", sum(!is.na(drug_data$Fu_median)), "/", nrow(drug_data), "\n")
+cat("Drugs with Fu:", sum(!is.na(drug_data$Fu_values)), "/", nrow(drug_data), "\n")
 ```
 
-## 6. PPB fallback → Fu_final
+## 6. PPB fallback → Fu_from_PPB
 
 Where no Fu is reported, plasma protein binding (%) is converted with
-`Fu = 1 - PPB/100`. `Fu_source` records which route each value came from.
+`Fu = 1 - PPB/100` and stored in `Fu_from_PPB`. Drugs that already have Fu
+values are not queried, so `Fu_from_PPB` is only filled for drugs with an empty
+`Fu_values`.
 
 ```{r ppb-fallback, message=TRUE}
 missing_fu <- drug_data |>
@@ -394,8 +388,7 @@ cat("Drugs missing Fu — checking PPB:", nrow(missing_fu), "\n")
 ppb_results <- dplyr::bind_rows(lapply(seq_len(nrow(missing_fu)), function(i) {
   drug      <- missing_fu$Drug[i]
   chembl_id <- missing_fu$ChEMBL_ID[i]
-  blank <- data.frame(Drug = drug, PPB_value = NA_real_,
-                      Fu_from_PPB = NA_real_, N_ppb = 0L,
+  blank <- data.frame(Drug = drug, Fu_from_PPB = NA_real_,
                       stringsAsFactors = FALSE)
 
   tryCatch({
@@ -410,9 +403,7 @@ ppb_results <- dplyr::bind_rows(lapply(seq_len(nrow(missing_fu)), function(i) {
 
     data.frame(
       Drug        = drug,
-      PPB_value   = ppb_median,
       Fu_from_PPB = 1 - (ppb_median / 100),
-      N_ppb       = nrow(filtered),
       stringsAsFactors = FALSE
     )
   }, error = function(e) {
@@ -421,248 +412,46 @@ ppb_results <- dplyr::bind_rows(lapply(seq_len(nrow(missing_fu)), function(i) {
   })
 }))
 
-drug_data <- drug_data |>
-  dplyr::left_join(ppb_results, by = "Drug") |>
-  dplyr::mutate(
-    Fu_source = dplyr::case_when(
-      !is.na(Fu_median)   ~ "ChEMBL_Fu",
-      !is.na(Fu_from_PPB) ~ "ChEMBL_PPB",
-      TRUE ~ NA_character_
-    ),
-    Fu_final = dplyr::coalesce(Fu_median, Fu_from_PPB)
-  )
+drug_data <- drug_data |> dplyr::left_join(ppb_results, by = "Drug")
 
-cat("Fu from PPB:", sum(drug_data$Fu_source == "ChEMBL_PPB", na.rm = TRUE), "\n")
-cat("Fu still missing (literature lookup needed):", sum(is.na(drug_data$Fu_final)), "\n")
+cat("Fu from PPB:", sum(!is.na(drug_data$Fu_from_PPB)), "\n")
+cat("No Fu and no PPB (literature lookup needed):",
+    sum(is.na(drug_data$Fu_values) & is.na(drug_data$Fu_from_PPB)), "\n")
 
-drug_data |> dplyr::filter(is.na(Fu_final)) |> dplyr::pull(Drug) |> print()
-
-save_main(drug_data)
-```
-
-## 7. Experimental pKa (ChEMBL)
-
-
-```{r experimental-pka, message=TRUE}
-pka_results <- dplyr::bind_rows(lapply(seq_len(nrow(drug_data)), function(i) {
-  drug      <- drug_data$Drug[i]
-  chembl_id <- drug_data$ChEMBL_ID[i]
-  blank <- data.frame(Drug = drug, pKa_exp = NA_real_, N_pka = 0L,
-                      pKa_values = NA_character_, stringsAsFactors = FALSE)
-
-  if (is.na(chembl_id)) return(blank)
-
-  tryCatch({
-    activities <- fetch_activity(chembl_id, "pKa")
-    if (is.null(activities)) return(blank)
-
-    filtered <- activities |>
-      dplyr::filter(!is.na(standard_value)) |>
-      dplyr::mutate(standard_value = as.numeric(standard_value)) |>
-      dplyr::filter(standard_value >= 0, standard_value <= 14)
-
-    if (nrow(filtered) == 0) return(blank)
-
-    data.frame(
-      Drug       = drug,
-      pKa_exp    = median(filtered$standard_value, na.rm = TRUE),
-      N_pka      = nrow(filtered),
-      pKa_values = paste(filtered$standard_value, collapse = ", "),
-      stringsAsFactors = FALSE
-    )
-  }, error = function(e) {
-    message("pKa error for ", drug, ": ", e$message)
-    blank
-  })
-}))
-
-drug_data <- drug_data |> dplyr::left_join(pka_results, by = "Drug")
-
-cat("Drugs with experimental pKa:", sum(!is.na(drug_data$pKa_exp)), "/", nrow(drug_data), "\n")
-```
-
-## 8. Experimental LogD7.4 (ChEMBL)
-
-Restricted to assays whose description mentions pH 7.4 or physiological pH.
-
-```{r experimental-logd, message=TRUE}
-logd_results <- dplyr::bind_rows(lapply(seq_len(nrow(drug_data)), function(i) {
-  drug      <- drug_data$Drug[i]
-  chembl_id <- drug_data$ChEMBL_ID[i]
-  blank <- data.frame(Drug = drug, LogD74_exp = NA_real_, N_logd = 0L,
-                      LogD_values = NA_character_, stringsAsFactors = FALSE)
-
-  if (is.na(chembl_id)) return(blank)
-
-  tryCatch({
-    activities <- fetch_activity(chembl_id, "LogD")
-    if (is.null(activities)) return(blank)
-
-    filtered <- activities |>
-      dplyr::filter(
-        !is.na(standard_value),
-        stringr::str_detect(tolower(assay_description), "7\\.4|7\\.40|physiolog")
-      ) |>
-      dplyr::mutate(standard_value = as.numeric(standard_value))
-
-    if (nrow(filtered) == 0) return(blank)
-
-    data.frame(
-      Drug        = drug,
-      LogD74_exp  = median(filtered$standard_value, na.rm = TRUE),
-      N_logd      = nrow(filtered),
-      LogD_values = paste(filtered$standard_value, collapse = ", "),
-      stringsAsFactors = FALSE
-    )
-  }, error = function(e) {
-    message("LogD error for ", drug, ": ", e$message)
-    blank
-  })
-}))
-
-drug_data <- drug_data |> dplyr::left_join(logd_results, by = "Drug")
-
-cat("Drugs with experimental LogD7.4:", sum(!is.na(drug_data$LogD74_exp)), "/", nrow(drug_data), "\n")
-
-save_main(drug_data)
-```
-
-## 9a. Export OPERA input
-
-Upload the written file to the EPA CompTox batch-search dashboard, request the
-OPERA predictions, and save the result as `data/new_opera_output.csv`.
-
-```{r opera-export}
 drug_data |>
-  dplyr::filter(!is.na(SMILES)) |>
-  dplyr::select(Drug, SMILES) |>
-  readr::write_csv("data/new_opera_input.csv")
-
-cat("SMILES exported:", sum(!is.na(drug_data$SMILES)), "drugs\n")
+  dplyr::filter(is.na(Fu_values), is.na(Fu_from_PPB)) |>
+  dplyr::pull(Drug) |>
+  print()
 ```
 
-## 9b. Merge OPERA predictions and assign Type
+## 7. Final columns
 
-`Type` classifies each drug from the OPERA predicted pKa values. It is a
-descriptive column 
+Keeps only the columns the dataset needs, and converts MW, PSA and LogP to
+numbers (they were kept as text above so that manual corrections and API
+values could be mixed).
 
-```{r opera-merge}
-opera_clean <- readr::read_csv("data/new_opera_output.csv", show_col_types = FALSE) |>
-  dplyr::select(
-    INPUT,
-    pKa_acid_pred = OPERA_PKAA_OPERA_PRED,
-    pKa_base_pred = OPERA_PKAB_OPERA_PRED,
-    LogD74_pred   = LOGD7.4,
-    LogP_opera    = OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED
-  ) |>
-  dplyr::mutate(dplyr::across(
-    c(pKa_acid_pred, pKa_base_pred, LogD74_pred, LogP_opera),
-    ~ as.numeric(dplyr::na_if(.x, "N/A"))
-  )) |>
-  dplyr::distinct(INPUT, .keep_all = TRUE)
+```{r final-columns}
+final_cols <- c("Drug", "ChEMBL_ID", "MW", "PSA", "HBD", "HBA", "LogP",
+                "SMILES", "Source", "Fu_values", "Fu_from_PPB")
 
 drug_data <- drug_data |>
-  dplyr::left_join(opera_clean, by = c("Drug" = "INPUT")) |>
-  dplyr::mutate(
-    Type = dplyr::case_when(
-      !is.na(pKa_acid_pred) & !is.na(pKa_base_pred) ~ "AMPHOLYTE",
-      !is.na(pKa_acid_pred) & is.na(pKa_base_pred)  ~ "ACID",
-      is.na(pKa_acid_pred) & !is.na(pKa_base_pred)  ~ "BASE",
-      TRUE ~ "NEUTRAL"
-    )
-  )
-
-cat("With OPERA pKa acid:", sum(!is.na(drug_data$pKa_acid_pred)), "\n")
-cat("With OPERA pKa base:", sum(!is.na(drug_data$pKa_base_pred)), "\n")
-cat("With OPERA LogD7.4:", sum(!is.na(drug_data$LogD74_pred)), "\n")
-drug_data |> dplyr::count(Type) |> print()
+  dplyr::select(dplyr::all_of(final_cols)) |>
+  dplyr::mutate(dplyr::across(c(MW, PSA, LogP), as.numeric))
 
 save_main(drug_data)
 ```
 
-## 10. RDKit descriptors
-
-Two outputs: the curated five descriptors joined into the main dataset with
-their ChEMBL differences, and the full descriptor table as its own dataset.
-
-```{r rdkit-descriptors, message=TRUE}
-rdkit_curated <- data.frame()
-rdkit_full    <- data.frame()
-
-for (i in seq_len(nrow(drug_data))) {
-  drug   <- drug_data$Drug[i]
-  smiles <- drug_data$SMILES[i]
-
-  blank <- data.frame(Drug = drug, MW_rdkit = NA_real_, PSA_rdkit = NA_real_,
-                      HBD_rdkit = NA_real_, HBA_rdkit = NA_real_,
-                      LogP_rdkit = NA_real_, stringsAsFactors = FALSE)
-
-  if (is.na(smiles)) {
-    rdkit_curated <- dplyr::bind_rows(rdkit_curated, blank)
-    rdkit_full    <- dplyr::bind_rows(rdkit_full, data.frame(Drug = drug))
-    next
-  }
-
-  tryCatch({
-    desc <- rdkitpyr::CalculateAllDescriptors(smiles)
-
-    rdkit_curated <- dplyr::bind_rows(rdkit_curated, data.frame(
-      Drug       = drug,
-      MW_rdkit   = desc$MolWt,
-      PSA_rdkit  = desc$TPSA,
-      HBD_rdkit  = desc$NumHDonors,
-      HBA_rdkit  = desc$NumHAcceptors,
-      LogP_rdkit = desc$MolLogP
-    ))
-
-    desc$Drug  <- drug
-    rdkit_full <- dplyr::bind_rows(rdkit_full, desc)
-  }, error = function(e) {
-    message("RDKit error for ", drug, ": ", e$message)
-    rdkit_curated <<- dplyr::bind_rows(rdkit_curated, blank)
-    rdkit_full    <<- dplyr::bind_rows(rdkit_full, data.frame(Drug = drug))
-  })
-
-  if (i %% 20 == 0) cat("Processed", i, "/", nrow(drug_data), "\n")
-}
-
-drug_data <- drug_data |>
-  dplyr::left_join(rdkit_curated, by = "Drug") |>
-  dplyr::mutate(
-    MW_chembl   = as.numeric(MW),
-    PSA_chembl  = as.numeric(PSA),
-    LogP_chembl = as.numeric(LogP),
-    MW_diff_rdkit   = abs(MW_chembl - MW_rdkit),
-    PSA_diff_rdkit  = abs(PSA_chembl - PSA_rdkit),
-    HBD_diff_rdkit  = abs(HBD - HBD_rdkit),
-    HBA_diff_rdkit  = abs(HBA - HBA_rdkit),
-    LogP_diff_rdkit = abs(LogP_chembl - LogP_rdkit)
-  )
-
-rdkit_full <- rdkit_full |> dplyr::select(Drug, dplyr::everything())
-saveRDS(rdkit_full, "data/rdkit_all_descriptors.rds")
-readr::write_csv(rdkit_full, "data/rdkit_all_descriptors.csv")
-
-cat("RDKit descriptors:", sum(!is.na(drug_data$MW_rdkit)), "/", nrow(drug_data), "\n")
-cat("Full descriptor table:", ncol(rdkit_full), "columns\n")
-
-save_main(drug_data)
-```
-
-## 11. Summary
+## 8. Summary
 
 ```{r summary}
 n <- nrow(drug_data)
 
 cat("MAIN DATASET :", n, "drugs,", ncol(drug_data), "columns\n\n")
-cat("ChEMBL_ID    ", sum(!is.na(drug_data$ChEMBL_ID)),  "/", n, "\n")
-cat("SMILES       ", sum(!is.na(drug_data$SMILES)),     "/", n, "\n")
-cat("MW           ", sum(!is.na(drug_data$MW)),         "/", n, "\n")
-cat("LogP         ", sum(!is.na(drug_data$LogP)),       "/", n, "\n")
-cat("Fu_final     ", sum(!is.na(drug_data$Fu_final)),   "/", n, "\n")
-cat("pKa_exp      ", sum(!is.na(drug_data$pKa_exp)),    "/", n, "\n")
-cat("LogD74_exp   ", sum(!is.na(drug_data$LogD74_exp)), "/", n, "\n")
-cat("LogD74_pred  ", sum(!is.na(drug_data$LogD74_pred)),"/", n, "\n")
-cat("MW_rdkit     ", sum(!is.na(drug_data$MW_rdkit)),   "/", n, "\n\n")
+cat("ChEMBL_ID    ", sum(!is.na(drug_data$ChEMBL_ID)),    "/", n, "\n")
+cat("SMILES       ", sum(!is.na(drug_data$SMILES)),       "/", n, "\n")
+cat("MW           ", sum(!is.na(drug_data$MW)),           "/", n, "\n")
+cat("LogP         ", sum(!is.na(drug_data$LogP)),         "/", n, "\n")
+cat("Fu_values    ", sum(!is.na(drug_data$Fu_values)),    "/", n, "\n")
+cat("Fu_from_PPB  ", sum(!is.na(drug_data$Fu_from_PPB)),  "/", n, "\n\n")
 cat("Next: run 02_pkasolver_logd.Rmd\n")
 ```
