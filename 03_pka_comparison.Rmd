@@ -6,20 +6,19 @@ output: html_notebook
 ## Purpose
 
 Builds the smaller side dataset `data/pka_comparison.rds`, holding the acid and
-base pKa for each drug from four sources:
+base pKa for each drug from three sources:
 
 | Source | Where it comes from |
 |---|---|
-| pkasolver v2 | already in the main dataset (notebook 02) |
-| OPERA | already in the main dataset (notebook 01) |
+| pkasolver | already in the main dataset (notebook 02, as `pKa_acid` / `pKa_base`) |
 | MolGpKa | fetched here from the xundrug API |
 | Uni-pKa | `unipka_predict.py`, run separately |
 
 Nothing here is written back into the main dataset . it is a comparison table
 only. Run after `01` and `02`.
 
-All four sources are filtered to pKa 3–11; acid takes the lowest value in
-range, base the highest.
+All three sources are filtered to pKa 3–11. Acid takes the lowest value in
+range and base takes the highest.
 
 ```{r setup, message=FALSE, warning=FALSE}
 library(httr2)
@@ -41,7 +40,7 @@ cat("Main dataset:", nrow(drug_data), "drugs\n")
 
 ## 1. MolGpKa
 
-Undocumented batch endpoint; one molecule per request, so the loop is paced to
+Undocumented batch endpoint one molecule per request, so the loop is paced to
 avoid rate limiting and failures are retried once with a longer pause.
 
 ```{r molgpka-function}
@@ -107,7 +106,7 @@ cat("MolGpKa base (raw):", sum(!is.na(molgpka_results$molgpka_base_raw)), "\n")
 
 ```{r molgpka-retry, message=TRUE}
 # Drugs that returned nothing at all are usually rate limiting, not real
-# absences - retry once at a slower pace.
+# absences : retry once at a slower pace.
 failed <- molgpka_results |>
   dplyr::filter(is.na(molgpka_acid_raw), is.na(molgpka_base_raw)) |>
   dplyr::pull(Drug)
@@ -161,22 +160,16 @@ if (file.exists(UNIPKA_CSV)) {
 ```{r build-comparison}
 pka_comparison <- drug_data |>
   dplyr::select(
-    Drug, SMILES, Type,
-    pkasolver_pKa_acid = pKa_acid_v2,
-    pkasolver_pKa_base = pKa_base_v2,
-    pkasolver_FG_acid  = FG_acid_v2,
-    pkasolver_FG_base  = FG_base_v2,
-    opera_pKa_acid     = pKa_acid_pred,
-    opera_pKa_base     = pKa_base_pred,
-    pKa_exp
+    Drug, SMILES,
+    pkasolver_pKa_acid = pKa_acid,
+    pkasolver_pKa_base = pKa_base
   ) |>
   dplyr::left_join(molgpka_results, by = "Drug") |>
   dplyr::left_join(unipka_results, by = "Drug") |>
   dplyr::select(
-    Drug, SMILES, Type, pKa_exp,
-    pkasolver_pKa_acid, opera_pKa_acid, molgpka_pKa_acid, unipka_pKa_acid,
-    pkasolver_pKa_base, opera_pKa_base, molgpka_pKa_base, unipka_pKa_base,
-    pkasolver_FG_acid, pkasolver_FG_base,
+    Drug, SMILES,
+    pkasolver_pKa_acid, molgpka_pKa_acid, unipka_pKa_acid,
+    pkasolver_pKa_base, molgpka_pKa_base, unipka_pKa_base,
     molgpka_acid_raw, molgpka_base_raw, molgpka_acid_N, molgpka_base_N
   )
 
@@ -192,16 +185,14 @@ How many drugs each method returns an in-range pKa for.
 
 ```{r coverage}
 coverage <- data.frame(
-  Method = c("pkasolver v2", "OPERA", "MolGpKa", "Uni-pKa"),
+  Method = c("pkasolver", "MolGpKa", "Uni-pKa"),
   N_acid = c(
     sum(!is.na(pka_comparison$pkasolver_pKa_acid)),
-    sum(!is.na(pka_comparison$opera_pKa_acid)),
     sum(!is.na(pka_comparison$molgpka_pKa_acid)),
     sum(!is.na(pka_comparison$unipka_pKa_acid))
   ),
   N_base = c(
     sum(!is.na(pka_comparison$pkasolver_pKa_base)),
-    sum(!is.na(pka_comparison$opera_pKa_base)),
     sum(!is.na(pka_comparison$molgpka_pKa_base)),
     sum(!is.na(pka_comparison$unipka_pKa_base))
   )
