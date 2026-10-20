@@ -1,5 +1,5 @@
 ---
-title: "02 — pkasolver pKa and calculated LogD7.4"
+title: "02  pkasolver pKa and calculated LogD7.4"
 output: html_notebook
 ---
 
@@ -7,8 +7,8 @@ output: html_notebook
 
 Adds the pkasolver pKa values and the calculated LogD7.4 to the main dataset
 `data/new_drug_dataset.rds`. Run after `01_dataset_properties.Rmd`.
-Please restart session once after running 01 and before running 02.
 
+Columns added (the only ones kept from this notebook):
 
 | Column | Meaning |
 |---|---|
@@ -27,7 +27,7 @@ Classification logic lives in `pka_classification.py`.
 > **Run this in a fresh R session if anything else has started Python.**
 > Once Python is initialised in an R session the environment cannot be
 > switched, so `use_condaenv()` here would fail. Notebook 01 no longer loads
-> `rdkitpyr`, so it does not start Python and a restart is normally not needed;
+> `rdkitpyr`, so it does not start Python and a restart is normally not needed.
 > the check below stays as a safeguard.
 
 ```{r setup, message=FALSE, warning=FALSE}
@@ -51,6 +51,14 @@ MAIN_RDS <- "data/new_drug_dataset.rds"
 MAIN_CSV <- "data/new_drug_dataset.csv"
 
 drug_data <- readRDS(MAIN_RDS)
+
+# 01 saves MW, PSA and LogP as numbers, but a dataset written by an older
+# version of 01 has them as text, which breaks the LogD calculation below
+# ("non-numeric argument to binary operator"). Converting here is harmless
+# when they are already numeric.
+drug_data <- drug_data |>
+  dplyr::mutate(dplyr::across(c(MW, PSA, LogP), as.numeric))
+
 cat("Loaded:", nrow(drug_data), "rows x", ncol(drug_data), "columns\n")
 ```
 
@@ -210,5 +218,5 @@ saveRDS(drug_data, MAIN_RDS)
 readr::write_csv(drug_data, MAIN_CSV)
 
 cat("MAIN DATASET COMPLETE :", nrow(drug_data), "rows x", ncol(drug_data), "columns\n")
-cat("Next: run 03_pka_comparison.Rmd for the pKa method comparison dataset if needed.\n")
+cat("Next: run 03_pka_comparison.Rmd for the pKa method comparison dataset if needed\n")
 ```
