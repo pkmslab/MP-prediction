@@ -1,5 +1,5 @@
 ---
-title: "02  pkasolver pKa and calculated LogD7.4"
+title: "02 — pkasolver pKa and calculated LogD7.4"
 output: html_notebook
 ---
 
@@ -27,7 +27,7 @@ Classification logic lives in `pka_classification.py`.
 > **Run this in a fresh R session if anything else has started Python.**
 > Once Python is initialised in an R session the environment cannot be
 > switched, so `use_condaenv()` here would fail. Notebook 01 no longer loads
-> `rdkitpyr`, so it does not start Python and a restart is normally not needed.
+> `rdkitpyr`, so it does not start Python and a restart is normally not needed;
 > the check below stays as a safeguard.
 
 ```{r setup, message=FALSE, warning=FALSE}
@@ -76,7 +76,7 @@ nz_int <- function(x) if (is.null(x) || length(x) == 0) 0L else as.integer(x)
 
 PKA_COLS <- c("pKa_pkasolver", "N_pka_pkasolver", "Type_pkasolver",
               "pKa_acid_v1", "pKa_base_v1", "pKa_acid_v2", "pKa_base_v2",
-              "FG_acid_v2", "FG_base_v2",
+              "FG_acid_v2", "FG_base_v2", "pkasolver_error",
               # final columns from a previous run
               "pKa_acid", "pKa_base", "LogD74_pred")
 
@@ -92,6 +92,7 @@ pkasolver_results <- dplyr::bind_rows(lapply(seq_len(nrow(drug_data)), function(
     Type_pkasolver = NA_character_, pKa_acid_v1 = NA_real_, pKa_base_v1 = NA_real_,
     pKa_acid_v2 = NA_real_, pKa_base_v2 = NA_real_,
     FG_acid_v2 = NA_character_, FG_base_v2 = NA_character_,
+    pkasolver_error = NA_character_,
     stringsAsFactors = FALSE
   )
 
@@ -117,11 +118,31 @@ pkasolver_results <- dplyr::bind_rows(lapply(seq_len(nrow(drug_data)), function(
     pKa_base_v2     = nz_num(res$pKa_base_v2),
     FG_acid_v2      = nz_chr(res$FG_acid_v2),
     FG_base_v2      = nz_chr(res$FG_base_v2),
+    pkasolver_error = nz_chr(res$Error),
     stringsAsFactors = FALSE
   )
 }))
 
 drug_data <- drug_data |> dplyr::left_join(pkasolver_results, by = "Drug")
+
+# pkasolver raising an error is not the same as "no ionisable site". If it
+# failed, say so and stop if it failed for every drug, because everything
+# downstream (f_neutral, LogD74_pred) would silently come out as "neutral".
+failed_rows <- drug_data |> dplyr::filter(!is.na(pkasolver_error))
+if (nrow(failed_rows) > 0) {
+  cat("\nPKASOLVER ERRORS:", nrow(failed_rows), "drugs\n")
+  print(as.data.frame(
+    failed_rows |> dplyr::count(pkasolver_error, sort = TRUE)
+  ))
+}
+
+if (sum(drug_data$N_pka_pkasolver > 0) == 0) {
+  stop("pkasolver found no ionisable sites for ANY drug. This means it failed, ",
+       "not that every drug is neutral. First error seen:\n  ",
+       dplyr::first(stats::na.omit(drug_data$pkasolver_error)),
+       "\nFix the environment and re-run this notebook; nothing was saved.",
+       call. = FALSE)
+}
 
 cat("\nPKASOLVER SUMMARY\n")
 cat("Sites found:     ", sum(drug_data$N_pka_pkasolver > 0), "/", nrow(drug_data), "\n")
@@ -133,7 +154,9 @@ cat("v2 acid / base:  ", sum(!is.na(drug_data$pKa_acid_v2)), "/",
 
 ## 2. Silent-failure check
 
-This should print zero rows.
+Sites found but neither v1 value set means the classification returned nothing
+usable — the pattern that hid the earlier `process_drug_batch` bug. This should
+print zero rows.
 
 ```{r silent-failure-check}
 suspicious <- drug_data |>
@@ -163,7 +186,7 @@ drug_data <- drug_data |>
     # A drug with no SMILES was never assessed at all, which is not the same as
     # a drug pkasolver assessed and found no ionisable site in. Without this
     # guard both pKa terms are absent, f_neutral comes out as exactly 1 and
-    # fraction_ionized as 0 , reading as "confirmed neutral" when the truth is
+    # fraction_ionized as 0 - reading as "confirmed neutral" when the truth is
     # "unknown". Rows that were assessed and genuinely have no site keep f = 1,
     # which is correct for them.
     .assessed = !is.na(SMILES),
@@ -218,5 +241,5 @@ saveRDS(drug_data, MAIN_RDS)
 readr::write_csv(drug_data, MAIN_CSV)
 
 cat("MAIN DATASET COMPLETE :", nrow(drug_data), "rows x", ncol(drug_data), "columns\n")
-cat("Next: run 03_pka_comparison.Rmd for the pKa method comparison dataset if needed\n")
+cat("Next: run 03_pka_comparison.Rmd for the pKa method comparison dataset\n")
 ```

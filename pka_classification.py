@@ -14,10 +14,77 @@ Two pKa selections are produced per molecule:
 `process_drug_full` is the entry point used by 02_pkasolver_logd.Rmd. It runs
 `calculate_microstate_pka_values` exactly once per molecule and returns the raw
 site list together with both selections.
+
+If pkasolver itself fails for a molecule, the returned dict carries the error
+text in "Error" (it is None on success), so a broken environment is visible
+instead of looking like "no ionisable sites".
 """
+
+import contextlib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 from rdkit import Chem
 from pkasolver.query import calculate_microstate_pka_values
+
+
+def _env_python():
+    """Path to the python executable of the CURRENT conda environment."""
+    if os.name == "nt":
+        candidate = os.path.join(sys.exec_prefix, "python.exe")
+    else:
+        candidate = os.path.join(sys.exec_prefix, "bin", "python")
+    return candidate if os.path.exists(candidate) else sys.executable
+
+
+@contextlib.contextmanager
+def _pkasolver_runtime():
+    """Make pkasolver's Dimorphite-DL subprocess call work everywhere.
+
+    pkasolver.query._call_dimorphite_dl() has three portability problems,
+    all worked around here WITHOUT modifying pkasolver:
+
+    1. It calls subprocess.run(["python", ...], stderr=STDOUT) without
+       setting stdout/stdin. Inside RStudio on Windows there is no console
+       handle to inherit, so Windows raises
+       "OSError: [WinError 6] The handle is invalid". We default stdin to
+       DEVNULL and stdout to PIPE.
+    2. It launches the literal command "python", which may be a different
+       interpreter (or the Microsoft Store stub) on another machine. We
+       substitute this environment's own interpreter.
+    3. The helper script writes its results to "test.pkl" in the current
+       working directory, which pkasolver then reads back. We run inside a
+       private temp directory so nothing is written into the project folder,
+       and clean up afterwards.
+    """
+    original_run = subprocess.run
+    old_cwd = os.getcwd()
+    tmp_dir = tempfile.mkdtemp(prefix="mp_dataset_")
+    env_python = _env_python()
+
+    def patched_run(cmd, *args, **kwargs):
+        if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "python":
+            cmd = [env_python] + list(cmd[1:])
+        if kwargs.get("stdin") is None:
+            kwargs["stdin"] = subprocess.DEVNULL
+        if kwargs.get("stdout") is None:
+            kwargs["stdout"] = subprocess.PIPE
+        return original_run(cmd, *args, **kwargs)
+
+    subprocess.run = patched_run
+    os.chdir(tmp_dir)
+    try:
+        yield
+    finally:
+        subprocess.run = original_run
+        os.chdir(old_cwd)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ACIDIC FUNCTIONAL GROUP PATTERNS
@@ -29,35 +96,35 @@ from pkasolver.query import calculate_microstate_pka_values
 
 
 ACIDIC_PATTERNS = {
-    "carboxylate": "C(=O)[O;H,-]",  
-    "phenol": "[O;H1;$(O-!@c)]",  
-    "sulfonamide": "[N;$(NS(=O)(=O))]",  
-    "heterocyclic_N_acidic": "[n;D2;H1;$(n1cccc1)]",  
-    "hydroxamate": "C(=O)N[OH]",  
-    "phosphate": "[O;$([O;D1]P(=O));!$(OP(=O)(=O))]", 
-    "tetrazole": "[nH]1nnnc1", 
-    "thiol": "[SH]", 
-    "alcohol": "[O;H1;$(O-!@[C;!$(C=!@[O,N,S])])]",  
-    "acidic_amide": "[CX3](=O)[NX3H2,NX3H1]",  
-    "acidic_aniline": "[NX3H2,NX3H1][cX3]:[c]", 
-    "carbamate": "[N;!$(NC(=O)OC(C)(C)C);!$(NC(=O)OC1c2ccccc2-c3c1cccc3);$(NC(=O)[O;D2])]",  
-    "hydrazide": "C(=O)N[NH2]", 
-    "imide": "[N;$(N(C(=O)[#6])C(=O)[#6])]", 
-    "sulfate": "OS(=O)(=O)[O-]", 
-    "carbonic_acid": "[CX3](=[OX1])([OX2H])[OX2H]",  
+    "carboxylate": "C(=O)[O;H,-]",
+    "phenol": "[O;H1;$(O-!@c)]",
+    "sulfonamide": "[N;$(NS(=O)(=O))]",
+    "heterocyclic_N_acidic": "[n;D2;H1;$(n1cccc1)]",
+    "hydroxamate": "C(=O)N[OH]",
+    "phosphate": "[O;$([O;D1]P(=O));!$(OP(=O)(=O))]",
+    "tetrazole": "[nH]1nnnc1",
+    "thiol": "[SH]",
+    "alcohol": "[O;H1;$(O-!@[C;!$(C=!@[O,N,S])])]",
+    "acidic_amide": "[CX3](=O)[NX3H2,NX3H1]",
+    "acidic_aniline": "[NX3H2,NX3H1][cX3]:[c]",
+    "carbamate": "[N;!$(NC(=O)OC(C)(C)C);!$(NC(=O)OC1c2ccccc2-c3c1cccc3);$(NC(=O)[O;D2])]",
+    "hydrazide": "C(=O)N[NH2]",
+    "imide": "[N;$(N(C(=O)[#6])C(=O)[#6])]",
+    "sulfate": "OS(=O)(=O)[O-]",
+    "carbonic_acid": "[CX3](=[OX1])([OX2H])[OX2H]",
 }
 
 
 # BASIC FUNCTIONAL GROUP PATTERNS
 
 BASIC_PATTERNS = {
-    "heterocyclic_N_basic_6ring": "[n;D2;$(n1ccccc1)]", 
-    "heterocyclic_N_basic_polyhet": "[n;D2;$(n1aaaaa1);!$(n1ccccc1)]", 
-    "heterocyclic_N_basic_5ring_polyhet": "[n;H0;$(n1aaaa1);!$(n1cccc1)]",  
-    "aliphatic_amine": "[N;$(N-[#6]);!$(N-[!#6;!#1]);!$(N-C=[O,N,S])]",  
-    "guanidine": "[N;$(NC(~N)=N)]", 
+    "heterocyclic_N_basic_6ring": "[n;D2;$(n1ccccc1)]",
+    "heterocyclic_N_basic_polyhet": "[n;D2;$(n1aaaaa1);!$(n1ccccc1)]",
+    "heterocyclic_N_basic_5ring_polyhet": "[n;H0;$(n1aaaa1);!$(n1cccc1)]",
+    "aliphatic_amine": "[N;$(N-[#6]);!$(N-[!#6;!#1]);!$(N-C=[O,N,S])]",
+    "guanidine": "[N;$(NC(~N)=N)]",
     "amidine": "[N;!R;$(N([#6])=[C;$(C(~N)~N);!$(C(~N)(~N)~N)]),$([N;D1]=[C;$(C(~N)~N);!$(C(~N)(~N)~N)])]",
-    "aniline": "c1cc([NH2])ccc1",  
+    "aniline": "c1cc([NH2])ccc1",
 }
 
 PKA_MIN = 3.0
@@ -99,7 +166,7 @@ def classify_site(state):
             return ("OTHER", pka, "unknown", "charge_fallback")
 
 
-def _empty_result():
+def _empty_result(error=None):
     return {
         "pKa_pkasolver": None,
         "N_pka_pkasolver": 0,
@@ -111,6 +178,7 @@ def _empty_result():
         "FG_acid_v2": None,
         "FG_base_v2": None,
         "All_sites_detail": None,
+        "Error": error,
     }
 
 
@@ -135,17 +203,19 @@ def process_drug_full(smiles):
 
     Returns a dict with the raw site list (pKa/type strings and count) plus the
     v1 and v2 acid/base selections and the v2 functional groups. Returns the
-    empty result - not None  when the molecule or pkasolver fails, so a failed
-    row is never silently dropped from the dataset.
+    empty result not None  when the molecule or pkasolver fails, so a failed
+    row is never silently dropped from the dataset. When pkasolver itself
+    raises, the error text is returned in "Error" so the notebook can show it.
     """
     mol = Chem.MolFromSmiles(smiles) if smiles else None
     if mol is None:
-        return _empty_result()
+        return _empty_result("invalid_smiles")
 
     try:
-        states = calculate_microstate_pka_values(mol, only_dimorphite=False)
-    except Exception:
-        return _empty_result()
+        with _pkasolver_runtime():
+            states = calculate_microstate_pka_values(mol, only_dimorphite=False)
+    except Exception as e:
+        return _empty_result("{}: {}".format(type(e).__name__, e))
 
     sites = [classify_site(s) for s in states]
     if not sites:
@@ -167,6 +237,7 @@ def process_drug_full(smiles):
         "FG_acid_v2": fg_acid_v2,
         "FG_base_v2": fg_base_v2,
         "All_sites_detail": str(sites),
+        "Error": None,
     }
 
 
